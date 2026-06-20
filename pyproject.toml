@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "renderer-server"
+version = "0.1.0"
+description = "Private LAN HTTPS import server for Markdown and diff rendering."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.111,<1.0",
+  "uvicorn[standard]>=0.30,<1.0",
+  "python-multipart>=0.0.9,<1.0",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+  "httpx>=0.27,<1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["renderer_server*"]
+
+[tool.setuptools.package-data]
+renderer_server = ["templates/*.html"]

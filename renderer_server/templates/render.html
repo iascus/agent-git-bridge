@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Imported content</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        -webkit-text-size-adjust: 100%;
+        text-size-adjust: 100%;
+        --border: color-mix(in srgb, CanvasText 18%, transparent);
+        --muted: color-mix(in srgb, CanvasText 62%, transparent);
+        --code-bg: color-mix(in srgb, CanvasText 7%, transparent);
+        --add-bg: light-dark(#eaf8ed, #14351d);
+        --add-fg: light-dark(#126128, #baf0c5);
+        --del-bg: light-dark(#fdeceb, #451a1a);
+        --del-fg: light-dark(#9f1c1c, #ffc4c0);
+        --hunk-bg: light-dark(#eef3ff, #172642);
+        --hunk-fg: light-dark(#224b9b, #b9ceff);
+      }
+
+      body {
+        margin: 0;
+        background: Canvas;
+        color: CanvasText;
+        overflow-x: hidden;
+      }
+
+      main {
+        margin: 0;
+        padding: 0;
+      }
+
+      header {
+        display: none;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 20px;
+        padding-bottom: 14px;
+      }
+
+      h1 {
+        font-size: 1.1rem;
+        margin: 0;
+      }
+
+      #kind {
+        font-size: 0.9rem;
+        opacity: 0.72;
+      }
+
+      #content {
+        box-sizing: border-box;
+        max-width: 100vw;
+        min-height: 60vh;
+        overflow-x: hidden;
+      }
+
+      .markdown {
+        box-sizing: border-box;
+        width: 100%;
+        max-width: none;
+        font-size: 1rem;
+        line-height: 1.65;
+        padding: 24px;
+      }
+
+      .markdown h1,
+      .markdown h2,
+      .markdown h3,
+      .markdown h4,
+      .markdown h5,
+      .markdown h6 {
+        line-height: 1.25;
+        margin: 1.4em 0 0.45em;
+      }
+
+      .markdown h1:first-child,
+      .markdown h2:first-child,
+      .markdown h3:first-child {
+        margin-top: 0;
+      }
+
+      .toc {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        margin: 0 0 24px;
+        padding: 14px 16px;
+      }
+
+      .toc h2 {
+        font-size: 0.95rem;
+        margin: 0 0 8px;
+      }
+
+      .toc ol {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+      }
+
+      .toc li {
+        margin: 4px 0;
+        padding-left: calc((var(--toc-level) - 1) * 16px);
+      }
+
+      .toc a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      .toc a:hover {
+        text-decoration: underline;
+      }
+
+      .heading-anchor {
+        color: var(--muted);
+        font-weight: 400;
+        margin-left: 0.28em;
+        opacity: 0;
+        text-decoration: none;
+      }
+
+      .markdown :is(h1, h2, h3, h4, h5, h6):hover .heading-anchor,
+      .heading-anchor:focus {
+        opacity: 1;
+      }
+
+      .markdown p,
+      .markdown ul,
+      .markdown ol,
+      .markdown table,
+      .markdown blockquote {
+        margin: 0 0 1em;
+      }
+
+      .markdown table {
+        border-collapse: collapse;
+        display: block;
+        max-width: 100%;
+        overflow-x: auto;
+        width: 100%;
+      }
+
+      .markdown th,
+      .markdown td {
+        border: 1px solid var(--border);
+        padding: 6px 8px;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      .markdown th {
+        background: var(--code-bg);
+        font-weight: 700;
+      }
+
+      .markdown blockquote {
+        border-left: 4px solid var(--border);
+        color: var(--muted);
+        padding-left: 14px;
+      }
+
+      .markdown code,
+      .markdown pre,
+      .plain-text {
+        font: 0.92rem/1.5 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      }
+
+      .diff-view {
+        font: 1rem/1.65 ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      }
+
+      .markdown code {
+        background: var(--code-bg);
+        border-radius: 4px;
+        padding: 0.08rem 0.28rem;
+      }
+
+      .markdown pre,
+      .plain-text {
+        box-sizing: border-box;
+        overflow: auto;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: var(--code-bg);
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .markdown pre code {
+        background: transparent;
+        border-radius: 0;
+        padding: 0;
+      }
+
+      .diff-view {
+        overflow: auto;
+        border: 0;
+        border-radius: 0;
+      }
+
+      .diff-table {
+        width: 100%;
+        border-collapse: collapse;
+        table-layout: fixed;
+      }
+
+      .diff-table td {
+        padding: 0 4px;
+        vertical-align: top;
+      }
+
+      .diff-line-number {
+        width: 4ch;
+        min-width: 0;
+        border-right: 1px solid var(--border);
+        color: var(--muted);
+        text-align: right;
+        user-select: none;
+        white-space: nowrap;
+      }
+
+      .diff-code {
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .diff-add {
+        background: var(--add-bg);
+        color: var(--add-fg);
+      }
+
+      .diff-del {
+        background: var(--del-bg);
+        color: var(--del-fg);
+      }
+
+      .diff-hunk,
+      .diff-file {
+        background: var(--hunk-bg);
+        color: var(--hunk-fg);
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Imported content</h1>
+        <span id="kind">Loading...</span>
+      </header>
+      <section id="content" aria-live="polite"></section>
+    </main>
+    <script>
+      const contentElement = document.getElementById("content");
+      const kindElement = document.getElementById("kind");
+      const importedContent = __IMPORTED_CONTENT_JSON__;
+      const importedKind = __IMPORTED_KIND_JSON__;
+
+      function detectKind(text) {
+        const firstContentLine = text
+          .replace(/\r\n?/g, "\n")
+          .split("\n")
+          .find((line) => line.trim() !== "") || "";
+        if (/^(diff\b|---\s|\+\+\+\s|@@\s)/.test(firstContentLine)) return "diff";
+
+        if (/^#{1,6}\s|\[[^\]]+\]\([^)]+\)|```|~~~|^\s*[-*]\s+/m.test(text)) return "markdown";
+
+        return "text";
+      }
+
+      function escapeHtml(value) {
+        return value
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("'", "&#39;");
+      }
+
+      function sanitizeUrl(value) {
+        const trimmed = value.trim();
+        if (/^(https?:|mailto:|tel:|#|\/)/i.test(trimmed)) return trimmed;
+        return "#";
+      }
+
+      function renderInlineMarkdown(text) {
+        let html = escapeHtml(text);
+        html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+        html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+        html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+        html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_match, label, url) => {
+          const href = escapeHtml(sanitizeUrl(url));
+          return `<a href="${href}" rel="noreferrer">${label}</a>`;
+        });
+        return html;
+      }
+
+      function parseTableRow(line) {
+        const trimmed = line.trim();
+        if (!trimmed.includes("|")) return null;
+        const withoutEdges = trimmed.replace(/^\|/, "").replace(/\|$/, "");
+        return withoutEdges.split("|").map((cell) => cell.trim());
+      }
+
+      function isTableSeparator(line) {
+        const cells = parseTableRow(line);
+        return Boolean(cells && cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell)));
+      }
+
+      function renderTable(headerCells, bodyRows) {
+        const head = headerCells.map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join("");
+        const body = bodyRows
+          .map((row) => `<tr>${row.map((cell) => `<td>${renderInlineMarkdown(cell)}</td>`).join("")}</tr>`)
+          .join("");
+        return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+      }
+
+      function plainHeadingText(markdown) {
+        return markdown
+          .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+          .replace(/[`*_~]/g, "")
+          .trim();
+      }
+
+      function slugifyHeading(text) {
+        const slug = text
+          .toLowerCase()
+          .normalize("NFKD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .replace(/[^a-z0-9\s-]/g, "")
+          .trim()
+          .replace(/\s+/g, "-")
+          .replace(/-+/g, "-");
+        return slug || "section";
+      }
+
+      function uniqueHeadingId(text, usedIds) {
+        const base = slugifyHeading(text);
+        const count = usedIds.get(base) || 0;
+        usedIds.set(base, count + 1);
+        return count === 0 ? base : `${base}-${count + 1}`;
+      }
+
+      function renderTableOfContents(items) {
+        if (!items.length) return "";
+        const links = items
+          .map((item) => {
+            const level = Math.min(Math.max(item.level, 1), 6);
+            return `<li style="--toc-level: ${level}"><a href="#${escapeHtml(item.id)}">${escapeHtml(item.text)}</a></li>`;
+          })
+          .join("");
+        return `<nav class="toc" aria-label="Table of contents"><h2>Contents</h2><ol>${links}</ol></nav>`;
+      }
+
+      function renderMarkdown(text) {
+        const lines = text.replace(/\r\n?/g, "\n").split("\n");
+        const parts = [];
+        const tocItems = [];
+        const usedHeadingIds = new Map();
+        let paragraph = [];
+        let listItems = [];
+        let quoteLines = [];
+        let codeLines = [];
+        let inCode = false;
+
+        function flushParagraph() {
+          if (!paragraph.length) return;
+          parts.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+          paragraph = [];
+        }
+
+        function flushList() {
+          if (!listItems.length) return;
+          parts.push(`<ul>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join("")}</ul>`);
+          listItems = [];
+        }
+
+        function flushQuote() {
+          if (!quoteLines.length) return;
+          parts.push(`<blockquote>${quoteLines.map((line) => `<p>${renderInlineMarkdown(line)}</p>`).join("")}</blockquote>`);
+          quoteLines = [];
+        }
+
+        function flushBlocks() {
+          flushParagraph();
+          flushList();
+          flushQuote();
+        }
+
+        for (let index = 0; index < lines.length; index++) {
+          const line = lines[index];
+          if (line.startsWith("```")) {
+            if (inCode) {
+              parts.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+              codeLines = [];
+              inCode = false;
+            } else {
+              flushBlocks();
+              inCode = true;
+            }
+            continue;
+          }
+
+          if (inCode) {
+            codeLines.push(line);
+            continue;
+          }
+
+          if (!line.trim()) {
+            flushBlocks();
+            continue;
+          }
+
+          const tableHeader = parseTableRow(line);
+          if (tableHeader && isTableSeparator(lines[index + 1] || "")) {
+            flushBlocks();
+            index += 2;
+            const bodyRows = [];
+            while (index < lines.length) {
+              const row = parseTableRow(lines[index]);
+              if (!row) break;
+              bodyRows.push(row);
+              index++;
+            }
+            index--;
+            parts.push(renderTable(tableHeader, bodyRows));
+            continue;
+          }
+
+          const heading = line.match(/^(#{1,6})\s+(.+)$/);
+          if (heading) {
+            flushBlocks();
+            const level = heading[1].length;
+            const headingText = plainHeadingText(heading[2]);
+            const id = uniqueHeadingId(headingText, usedHeadingIds);
+            tocItems.push({ level, text: headingText, id });
+            parts.push(
+              `<h${level} id="${escapeHtml(id)}">${renderInlineMarkdown(heading[2])}<a class="heading-anchor" href="#${escapeHtml(id)}" aria-label="Link to ${escapeHtml(headingText)}">#</a></h${level}>`
+            );
+            continue;
+          }
+
+          const listItem = line.match(/^\s*[-*]\s+(.+)$/);
+          if (listItem) {
+            flushParagraph();
+            flushQuote();
+            listItems.push(listItem[1]);
+            continue;
+          }
+
+          const quote = line.match(/^>\s?(.*)$/);
+          if (quote) {
+            flushParagraph();
+            flushList();
+            quoteLines.push(quote[1]);
+            continue;
+          }
+
+          flushList();
+          flushQuote();
+          paragraph.push(line.trim());
+        }
+
+        if (inCode) {
+          parts.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+        }
+        flushBlocks();
+
+        const wrapper = document.createElement("article");
+        wrapper.className = "markdown";
+        wrapper.innerHTML = `${renderTableOfContents(tocItems)}${parts.join("\n")}` || "<p></p>";
+        return wrapper;
+      }
+
+      function renderDiff(text) {
+        const wrapper = document.createElement("div");
+        wrapper.className = "diff-view";
+        const table = document.createElement("table");
+        table.className = "diff-table";
+        const tbody = document.createElement("tbody");
+
+        text.replace(/\r\n?/g, "\n").split("\n").forEach((line, index) => {
+          const row = document.createElement("tr");
+          const number = document.createElement("td");
+          const code = document.createElement("td");
+
+          number.className = "diff-line-number";
+          code.className = "diff-code";
+          number.textContent = String(index + 1);
+          code.textContent = line || " ";
+
+          if (line.startsWith("+") && !line.startsWith("+++")) row.classList.add("diff-add");
+          else if (line.startsWith("-") && !line.startsWith("---")) row.classList.add("diff-del");
+          else if (line.startsWith("@@")) row.classList.add("diff-hunk");
+          else if (/^diff\b/.test(line) || line.startsWith("---") || line.startsWith("+++")) row.classList.add("diff-file");
+
+          row.append(number, code);
+          tbody.append(row);
+        });
+
+        table.append(tbody);
+        wrapper.append(table);
+        return wrapper;
+      }
+
+      function renderPlainText(text) {
+        const pre = document.createElement("pre");
+        pre.className = "plain-text";
+        pre.textContent = text;
+        return pre;
+      }
+
+      function renderContent(text, knownKind) {
+        const kind = knownKind || detectKind(text);
+        kindElement.textContent = kind;
+        contentElement.replaceChildren(
+          kind === "markdown" ? renderMarkdown(text) :
+          kind === "diff" ? renderDiff(text) :
+          renderPlainText(text)
+        );
+      }
+
+      try {
+        renderContent(importedContent, importedKind);
+      } catch (error) {
+        kindElement.textContent = "error";
+        contentElement.replaceChildren(renderPlainText(error.message));
+      }
+    </script>
+  </body>
+</html>
