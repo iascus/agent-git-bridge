@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -32,12 +32,6 @@ def utc_now() -> datetime:
 
 def format_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def parse_timestamp(value: str) -> datetime:
-    if value.endswith("Z"):
-        value = value[:-1] + "+00:00"
-    return datetime.fromisoformat(value).astimezone(UTC)
 
 
 def sanitize_filename(filename: str | None) -> str | None:
@@ -79,7 +73,7 @@ class FileStorage:
         metadata = {
             "filename": sanitize_filename(filename),
             "content_type": content_type or "text/plain",
-            "created_at": format_timestamp(created),
+            "updated_at": format_timestamp(created),
             "size_bytes": len(encoded),
         }
 
@@ -100,31 +94,3 @@ class FileStorage:
         if not self.meta_path.is_file():
             raise ContentNotFound("No content has been imported")
         return json.loads(self.meta_path.read_text(encoding="utf-8"))
-
-
-def cleanup_expired_imports(storage_dir: Path, retention_hours: int, *, now: datetime | None = None) -> int:
-    if retention_hours < 0:
-        raise ValueError("retention_hours must be non-negative")
-    if not storage_dir.exists():
-        return 0
-
-    cutoff = (now or utc_now()) - timedelta(hours=retention_hours)
-    meta_path = storage_dir / "meta.json"
-    content_path = storage_dir / "content.txt"
-    try:
-        metadata = json.loads(meta_path.read_text(encoding="utf-8"))
-        created_at = parse_timestamp(metadata["created_at"])
-    except (OSError, KeyError, json.JSONDecodeError, ValueError):
-        return 0
-
-    if created_at >= cutoff:
-        return 0
-
-    removed = 0
-    for path in (content_path, meta_path):
-        try:
-            path.unlink()
-            removed = 1
-        except FileNotFoundError:
-            pass
-    return removed

@@ -3,6 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" href="/favicon.ico">
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png">
     <title>Imported content</title>
     <style>
       :root {
@@ -17,6 +19,8 @@
         --add-fg: light-dark(#126128, #baf0c5);
         --del-bg: light-dark(#fdeceb, #451a1a);
         --del-fg: light-dark(#9f1c1c, #ffc4c0);
+        --word-add-bg: light-dark(#9be9a8, #286b38);
+        --word-del-bg: light-dark(#ffb8b4, #8b3434);
         --hunk-bg: light-dark(#eef3ff, #172642);
         --hunk-fg: light-dark(#224b9b, #b9ceff);
       }
@@ -241,6 +245,20 @@
       .diff-del {
         background: var(--del-bg);
         color: var(--del-fg);
+      }
+
+      .diff-word-add,
+      .diff-word-del {
+        border-radius: 3px;
+        font-weight: 700;
+      }
+
+      .diff-word-add {
+        background: var(--word-add-bg);
+      }
+
+      .diff-word-del {
+        background: var(--word-del-bg);
       }
 
       .diff-hunk,
@@ -488,7 +506,10 @@
         table.className = "diff-table";
         const tbody = document.createElement("tbody");
 
-        text.replace(/\r\n?/g, "\n").split("\n").forEach((line, index) => {
+        const lines = text.replace(/\r\n?/g, "\n").split("\n");
+        const wordChanges = findWordChanges(lines);
+
+        lines.forEach((line, index) => {
           const row = document.createElement("tr");
           const number = document.createElement("td");
           const code = document.createElement("td");
@@ -496,7 +517,14 @@
           number.className = "diff-line-number";
           code.className = "diff-code";
           number.textContent = String(index + 1);
-          code.textContent = line || " ";
+          const changes = wordChanges.get(index);
+          if (changes) {
+            const marker = document.createElement("span");
+            marker.textContent = line[0];
+            code.append(marker, renderWordChanges(changes, line[0] === "+" ? "add" : "del"));
+          } else {
+            code.textContent = line || " ";
+          }
 
           if (line.startsWith("+") && !line.startsWith("+++")) row.classList.add("diff-add");
           else if (line.startsWith("-") && !line.startsWith("---")) row.classList.add("diff-del");
@@ -510,6 +538,104 @@
         table.append(tbody);
         wrapper.append(table);
         return wrapper;
+      }
+
+      function tokenizeDiffText(text) {
+        return text.match(/\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]+/gu) || [];
+      }
+
+      function diffWords(oldText, newText) {
+        const oldTokens = tokenizeDiffText(oldText);
+        const newTokens = tokenizeDiffText(newText);
+        if (oldTokens.length * newTokens.length > 100000) {
+          return {
+            oldResult: [{ text: oldText, changed: true }],
+            newResult: [{ text: newText, changed: true }]
+          };
+        }
+        const table = Array.from(
+          { length: oldTokens.length + 1 },
+          () => new Uint32Array(newTokens.length + 1)
+        );
+
+        for (let oldIndex = oldTokens.length - 1; oldIndex >= 0; oldIndex--) {
+          for (let newIndex = newTokens.length - 1; newIndex >= 0; newIndex--) {
+            table[oldIndex][newIndex] = oldTokens[oldIndex] === newTokens[newIndex]
+              ? table[oldIndex + 1][newIndex + 1] + 1
+              : Math.max(table[oldIndex + 1][newIndex], table[oldIndex][newIndex + 1]);
+          }
+        }
+
+        const oldResult = [];
+        const newResult = [];
+        let oldIndex = 0;
+        let newIndex = 0;
+        while (oldIndex < oldTokens.length || newIndex < newTokens.length) {
+          if (
+            oldIndex < oldTokens.length &&
+            newIndex < newTokens.length &&
+            oldTokens[oldIndex] === newTokens[newIndex]
+          ) {
+            oldResult.push({ text: oldTokens[oldIndex], changed: false });
+            newResult.push({ text: newTokens[newIndex], changed: false });
+            oldIndex++;
+            newIndex++;
+          } else if (
+            newIndex < newTokens.length &&
+            (oldIndex === oldTokens.length ||
+              table[oldIndex][newIndex + 1] >= table[oldIndex + 1][newIndex])
+          ) {
+            newResult.push({ text: newTokens[newIndex], changed: true });
+            newIndex++;
+          } else {
+            oldResult.push({ text: oldTokens[oldIndex], changed: true });
+            oldIndex++;
+          }
+        }
+        return { oldResult, newResult };
+      }
+
+      function findWordChanges(lines) {
+        const changes = new Map();
+        let index = 0;
+        while (index < lines.length) {
+          if (!lines[index].startsWith("-") || lines[index].startsWith("---")) {
+            index++;
+            continue;
+          }
+
+          const deleted = [];
+          while (index < lines.length && lines[index].startsWith("-") && !lines[index].startsWith("---")) {
+            deleted.push(index++);
+          }
+          const added = [];
+          while (index < lines.length && lines[index].startsWith("+") && !lines[index].startsWith("+++")) {
+            added.push(index++);
+          }
+
+          const pairCount = Math.min(deleted.length, added.length);
+          for (let pair = 0; pair < pairCount; pair++) {
+            const result = diffWords(lines[deleted[pair]].slice(1), lines[added[pair]].slice(1));
+            changes.set(deleted[pair], result.oldResult);
+            changes.set(added[pair], result.newResult);
+          }
+        }
+        return changes;
+      }
+
+      function renderWordChanges(parts, kind) {
+        const fragment = document.createDocumentFragment();
+        parts.forEach((part) => {
+          if (!part.changed) {
+            fragment.append(document.createTextNode(part.text));
+            return;
+          }
+          const span = document.createElement("span");
+          span.className = kind === "add" ? "diff-word-add" : "diff-word-del";
+          span.textContent = part.text;
+          fragment.append(span);
+        });
+        return fragment;
       }
 
       function renderPlainText(text) {

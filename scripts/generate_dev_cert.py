@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+import socket
 from datetime import UTC, datetime, timedelta
 from ipaddress import ip_address
 from pathlib import Path
@@ -11,7 +13,15 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
 CERT_DIR = Path("certs")
-LAN_IP = "192.168.68.106"
+
+
+def detect_lan_ip() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        try:
+            sock.connect(("192.0.2.1", 80))
+            return sock.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
 
 
 def write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
@@ -25,7 +35,13 @@ def write_key(path: Path, key: rsa.RSAPrivateKey) -> None:
 
 
 def main() -> None:
-    CERT_DIR.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser(description="Generate a CA and LAN HTTPS certificate.")
+    parser.add_argument("--lan-ip", default=detect_lan_ip(), help="LAN IPv4 address for the certificate SAN")
+    parser.add_argument("--cert-dir", type=Path, default=CERT_DIR, help="Directory to write certificate files")
+    args = parser.parse_args()
+    lan_ip = str(ip_address(args.lan_ip))
+    cert_dir = args.cert_dir
+    cert_dir.mkdir(parents=True, exist_ok=True)
 
     now = datetime.now(UTC)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=3072)
@@ -55,6 +71,10 @@ def main() -> None:
             ),
             critical=True,
         )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()),
+            critical=False,
+        )
         .sign(ca_key, hashes.SHA256())
     )
 
@@ -73,7 +93,7 @@ def main() -> None:
         .add_extension(
             x509.SubjectAlternativeName(
                 [
-                    x509.IPAddress(ip_address(LAN_IP)),
+                    x509.IPAddress(ip_address(lan_ip)),
                     x509.IPAddress(ip_address("127.0.0.1")),
                     x509.DNSName("localhost"),
                 ]
@@ -85,20 +105,31 @@ def main() -> None:
             x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
             critical=False,
         )
+        .add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(server_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
         .sign(ca_key, hashes.SHA256())
     )
 
-    write_key(CERT_DIR / "local-ca.key", ca_key)
-    write_key(CERT_DIR / "server.key", server_key)
-    (CERT_DIR / "local-ca.crt").write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
-    (CERT_DIR / "server.crt").write_bytes(
-        server_cert.public_bytes(serialization.Encoding.PEM)
-    )
+    write_key(cert_dir / "local-ca.key", ca_key)
+    write_key(cert_dir / "server.key", server_key)
+    ca_pem = ca_cert.public_bytes(serialization.Encoding.PEM)
+    server_pem = server_cert.public_bytes(serialization.Encoding.PEM)
+    (cert_dir / "local-ca.crt").write_bytes(ca_pem)
+    (cert_dir / "server.crt").write_bytes(server_pem)
+    (cert_dir / "server-chain.crt").write_bytes(server_pem + ca_pem)
 
-    print("Wrote certs/local-ca.crt")
-    print("Wrote certs/local-ca.key")
-    print("Wrote certs/server.crt")
-    print("Wrote certs/server.key")
+    print(f"Generated certificate for LAN IP {lan_ip}")
+    print(f"Wrote {cert_dir / 'local-ca.crt'}")
+    print(f"Wrote {cert_dir / 'local-ca.key'}")
+    print(f"Wrote {cert_dir / 'server.crt'}")
+    print(f"Wrote {cert_dir / 'server-chain.crt'}")
+    print(f"Wrote {cert_dir / 'server.key'}")
 
 
 if __name__ == "__main__":

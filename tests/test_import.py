@@ -31,6 +31,22 @@ def test_import_rejects_missing_token(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/favicon.ico",
+        "/apple-touch-icon.png",
+        "/apple-touch-icon-precomposed.png",
+    ],
+)
+def test_browser_icons_are_served(client: TestClient, path: str) -> None:
+    response = client.get(path)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/png"
+    assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
+
+
 def test_import_rejects_wrong_token(client: TestClient) -> None:
     response = client.post(
         "/import",
@@ -105,6 +121,29 @@ def test_next_import_overwrites_current_content(client: TestClient) -> None:
     render = client.get("/render").text
     assert "new-content-marker" in render
     assert "old-content-marker" not in render
+
+
+def test_api_content_and_meta_return_latest_import(client: TestClient) -> None:
+    client.post(
+        "/import",
+        json={"content": "latest", "filename": "latest.md"},
+        headers=auth_headers(),
+    )
+
+    content = client.get("/api/content")
+    metadata = client.get("/api/meta")
+
+    assert content.status_code == 200
+    assert content.text == "latest"
+    assert content.headers["content-type"].startswith("text/plain")
+    assert metadata.status_code == 200
+    assert metadata.json()["filename"] == "latest.md"
+    assert metadata.json()["updated_at"].endswith("Z")
+
+
+def test_api_endpoints_return_404_before_first_import(client: TestClient) -> None:
+    assert client.get("/api/content").status_code == 404
+    assert client.get("/api/meta").status_code == 404
 
 
 def test_render_page_opens_for_import(client: TestClient) -> None:
@@ -215,6 +254,22 @@ def test_render_page_uses_readable_wrapping_diff_styles(client: TestClient) -> N
     assert "table-layout: fixed" in response.text
     assert "white-space: pre-wrap" in response.text
     assert "overflow-wrap: anywhere" in response.text
+
+
+def test_render_page_includes_word_level_diff_renderer(client: TestClient) -> None:
+    client.post(
+        "/import",
+        content="--- a\n+++ b\n@@ -1 +1 @@\n-The old brown fox\n+The quick brown fox",
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert "function diffWords" in response.text
+    assert "function findWordChanges" in response.text
+    assert "diff-word-add" in response.text
+    assert "diff-word-del" in response.text
 
 
 def test_render_embeds_content_without_closing_script_tag(client: TestClient) -> None:
