@@ -221,30 +221,19 @@
         vertical-align: top;
       }
 
-      .diff-line-number {
-        width: 4ch;
-        min-width: 0;
-        border-right: 1px solid var(--border);
-        color: var(--muted);
-        text-align: right;
-        user-select: none;
-        white-space: nowrap;
-      }
-
       .diff-code {
         overflow-wrap: anywhere;
+        padding-left: 8px;
         white-space: pre-wrap;
         word-break: break-word;
       }
 
       .diff-add {
         background: var(--add-bg);
-        color: var(--add-fg);
       }
 
       .diff-del {
         background: var(--del-bg);
-        color: var(--del-fg);
       }
 
       .diff-word-add,
@@ -255,10 +244,12 @@
 
       .diff-word-add {
         background: var(--word-add-bg);
+        color: CanvasText;
       }
 
       .diff-word-del {
         background: var(--word-del-bg);
+        color: CanvasText;
       }
 
       .diff-hunk,
@@ -277,20 +268,26 @@
       </header>
       <section id="content" aria-live="polite"></section>
     </main>
+    <script src="/static/jsdiff.min.js"></script>
     <script>
       const contentElement = document.getElementById("content");
       const kindElement = document.getElementById("kind");
       const importedContent = __IMPORTED_CONTENT_JSON__;
       const importedKind = __IMPORTED_KIND_JSON__;
 
+      function stripLeadingBom(text) {
+        return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+      }
+
       function detectKind(text) {
-        const firstContentLine = text
+        const normalizedText = stripLeadingBom(text);
+        const firstContentLine = normalizedText
           .replace(/\r\n?/g, "\n")
           .split("\n")
           .find((line) => line.trim() !== "") || "";
         if (/^(diff\b|---\s|\+\+\+\s|@@\s)/.test(firstContentLine)) return "diff";
 
-        if (/^#{1,6}\s|\[[^\]]+\]\([^)]+\)|```|~~~|^\s*[-*]\s+/m.test(text)) return "markdown";
+        if (/^#{1,6}\s|\[[^\]]+\]\([^)]+\)|```|~~~|^\s*[-*]\s+/m.test(normalizedText)) return "markdown";
 
         return "text";
       }
@@ -380,7 +377,7 @@
       }
 
       function renderMarkdown(text) {
-        const lines = text.replace(/\r\n?/g, "\n").split("\n");
+        const lines = stripLeadingBom(text).replace(/\r\n?/g, "\n").split("\n");
         const parts = [];
         const tocItems = [];
         const usedHeadingIds = new Map();
@@ -506,17 +503,15 @@
         table.className = "diff-table";
         const tbody = document.createElement("tbody");
 
-        const lines = text.replace(/\r\n?/g, "\n").split("\n");
-        const wordChanges = findWordChanges(lines);
+        const lines = stripLeadingBom(text).replace(/\r\n?/g, "\n").split("\n");
+        const lineTypes = buildDiffLineTypes(lines);
+        const wordChanges = findWordChanges(lines, lineTypes);
 
         lines.forEach((line, index) => {
           const row = document.createElement("tr");
-          const number = document.createElement("td");
           const code = document.createElement("td");
 
-          number.className = "diff-line-number";
           code.className = "diff-code";
-          number.textContent = String(index + 1);
           const changes = wordChanges.get(index);
           if (changes) {
             const marker = document.createElement("span");
@@ -526,12 +521,12 @@
             code.textContent = line || " ";
           }
 
-          if (line.startsWith("+") && !line.startsWith("+++")) row.classList.add("diff-add");
-          else if (line.startsWith("-") && !line.startsWith("---")) row.classList.add("diff-del");
-          else if (line.startsWith("@@")) row.classList.add("diff-hunk");
-          else if (/^diff\b/.test(line) || line.startsWith("---") || line.startsWith("+++")) row.classList.add("diff-file");
+          if (lineTypes[index] === "add") row.classList.add("diff-add");
+          else if (lineTypes[index] === "del") row.classList.add("diff-del");
+          else if (lineTypes[index] === "hunk") row.classList.add("diff-hunk");
+          else if (lineTypes[index] === "file") row.classList.add("diff-file");
 
-          row.append(number, code);
+          row.append(code);
           tbody.append(row);
         });
 
@@ -544,7 +539,88 @@
         return text.match(/\s+|[\p{L}\p{N}_]+|[^\s\p{L}\p{N}_]+/gu) || [];
       }
 
+      function jsDiffWords(oldText, newText) {
+        if (!window.Diff || typeof window.Diff.diffWordsWithSpace !== "function") return null;
+        const changes = window.Diff.diffWordsWithSpace(oldText, newText, { timeout: 1000 });
+        if (!changes) return null;
+
+        const oldResult = [];
+        const newResult = [];
+        changes.forEach((change) => {
+          const part = { text: change.value, changed: Boolean(change.added || change.removed) };
+          if (change.added) {
+            newResult.push(part);
+          } else if (change.removed) {
+            oldResult.push(part);
+          } else {
+            oldResult.push(part);
+            newResult.push({ text: change.value, changed: false });
+          }
+        });
+        return { oldResult, newResult };
+      }
+
+      function parseHunkCounts(line) {
+        const match = line.match(/^@@\s+-\d+(?:,(\d+))?\s+\+\d+(?:,(\d+))?/);
+        if (!match) return null;
+        return {
+          oldRemaining: match[1] === undefined ? 1 : Number(match[1]),
+          newRemaining: match[2] === undefined ? 1 : Number(match[2])
+        };
+      }
+
+      function buildDiffLineTypes(lines) {
+        const types = [];
+        let hunk = null;
+
+        lines.forEach((line, index) => {
+          if (/^diff\b/.test(line)) {
+            types[index] = "file";
+            hunk = null;
+            return;
+          }
+
+          const parsedHunk = parseHunkCounts(line);
+          if (parsedHunk) {
+            types[index] = "hunk";
+            hunk = parsedHunk;
+            return;
+          }
+
+          if (!hunk) {
+            types[index] = line.startsWith("---") || line.startsWith("+++") ? "file" : "context";
+            return;
+          }
+
+          if (line.startsWith("\\ No newline")) {
+            types[index] = "context";
+            return;
+          }
+
+          if (line.startsWith("-")) {
+            types[index] = "del";
+            hunk.oldRemaining = Math.max(0, hunk.oldRemaining - 1);
+          } else if (line.startsWith("+")) {
+            types[index] = "add";
+            hunk.newRemaining = Math.max(0, hunk.newRemaining - 1);
+          } else {
+            types[index] = "context";
+            hunk.oldRemaining = Math.max(0, hunk.oldRemaining - 1);
+            hunk.newRemaining = Math.max(0, hunk.newRemaining - 1);
+          }
+
+          if (hunk.oldRemaining === 0 && hunk.newRemaining === 0) {
+            hunk = null;
+          }
+        });
+
+        return types;
+      }
+
       function diffWords(oldText, newText) {
+        const jsDiffResult = jsDiffWords(oldText, newText);
+        if (jsDiffResult) return jsDiffResult;
+
         const oldTokens = tokenizeDiffText(oldText);
         const newTokens = tokenizeDiffText(newText);
         if (oldTokens.length * newTokens.length > 100000) {
@@ -595,21 +671,21 @@
         return { oldResult, newResult };
       }
 
-      function findWordChanges(lines) {
+      function findWordChanges(lines, lineTypes) {
         const changes = new Map();
         let index = 0;
         while (index < lines.length) {
-          if (!lines[index].startsWith("-") || lines[index].startsWith("---")) {
+          if (lineTypes[index] !== "del") {
             index++;
             continue;
           }
 
           const deleted = [];
-          while (index < lines.length && lines[index].startsWith("-") && !lines[index].startsWith("---")) {
+          while (index < lines.length && lineTypes[index] === "del") {
             deleted.push(index++);
           }
           const added = [];
-          while (index < lines.length && lines[index].startsWith("+") && !lines[index].startsWith("+++")) {
+          while (index < lines.length && lineTypes[index] === "add") {
             added.push(index++);
           }
 

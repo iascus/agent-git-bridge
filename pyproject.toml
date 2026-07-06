@@ -28,4 +28,4 @@ pythonpath = ["."]
 include = ["renderer_server*"]
 
 [tool.setuptools.package-data]
-renderer_server = ["templates/*.html"]
+renderer_server = ["templates/*.html", "static/*.js", "static/*.txt"]

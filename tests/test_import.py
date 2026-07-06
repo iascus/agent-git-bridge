@@ -47,6 +47,14 @@ def test_browser_icons_are_served(client: TestClient, path: str) -> None:
     assert response.content.startswith(b"\x89PNG\r\n\x1a\n")
 
 
+def test_jsdiff_static_asset_is_served(client: TestClient) -> None:
+    response = client.get("/static/jsdiff.min.js")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/javascript")
+    assert b"diffWordsWithSpace" in response.content
+
+
 def test_import_rejects_wrong_token(client: TestClient) -> None:
     response = client.post(
         "/import",
@@ -183,6 +191,12 @@ def test_chatgpt_style_diff_command_is_detected_as_diff() -> None:
     assert detect_content_kind(text) == "diff"
 
 
+def test_bom_prefixed_diff_is_detected_as_diff() -> None:
+    text = "\ufeff--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n"
+
+    assert detect_content_kind(text) == "diff"
+
+
 def test_markdown_with_fenced_diff_block_is_detected_as_markdown() -> None:
     text = """# Release notes
 
@@ -240,6 +254,20 @@ def test_render_embeds_detected_diff_kind(client: TestClient) -> None:
     assert 'const importedKind = "diff";' in response.text
 
 
+def test_render_embeds_detected_diff_kind_for_bom_prefixed_diff(client: TestClient) -> None:
+    client.post(
+        "/import",
+        content="\ufeff--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-Old\n+New\n",
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert 'const importedKind = "diff";' in response.text
+    assert "function stripLeadingBom" in response.text
+
+
 def test_render_page_uses_readable_wrapping_diff_styles(client: TestClient) -> None:
     client.post(
         "/import",
@@ -266,10 +294,44 @@ def test_render_page_includes_word_level_diff_renderer(client: TestClient) -> No
     response = client.get("/render")
 
     assert response.status_code == 200
+    assert '<script src="/static/jsdiff.min.js"></script>' in response.text
+    assert "function jsDiffWords" in response.text
+    assert "window.Diff.diffWordsWithSpace" in response.text
     assert "function diffWords" in response.text
     assert "function findWordChanges" in response.text
     assert "diff-word-add" in response.text
     assert "diff-word-del" in response.text
+
+
+def test_diff_row_styles_do_not_color_unchanged_words_as_changed(client: TestClient) -> None:
+    client.post(
+        "/import",
+        content="--- a\n+++ b\n@@ -1 +1 @@\n-The old brown fox\n+The quick brown fox",
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert ".diff-add {\n        background: var(--add-bg);\n      }" in response.text
+    assert ".diff-del {\n        background: var(--del-bg);\n      }" in response.text
+    assert ".diff-word-add {\n        background: var(--word-add-bg);\n        color: CanvasText;\n      }" in response.text
+    assert ".diff-word-del {\n        background: var(--word-del-bg);\n        color: CanvasText;\n      }" in response.text
+
+
+def test_render_diff_classifies_hunk_marker_like_content_as_changed(client: TestClient) -> None:
+    client.post(
+        "/import",
+        content="--- a\n+++ b\n@@ -1 +1 @@\n---old\n+++new\n",
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert "function buildDiffLineTypes" in response.text
+    assert 'lineTypes[index] === "add"' in response.text
+    assert 'lineTypes[index] === "del"' in response.text
 
 
 def test_render_embeds_content_without_closing_script_tag(client: TestClient) -> None:

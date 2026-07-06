@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.datastructures import UploadFile
 
 from .auth import require_import_token
@@ -20,6 +20,7 @@ from .storage import (
 
 
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "render.html"
+STATIC_PATH = Path(__file__).parent / "static"
 DIFF_START_RE = re.compile(r"^(diff\b|---\s|\+\+\+\s|@@\s)")
 MARKDOWN_RE = re.compile(r"^#{1,6}\s|\[[^\]]+\]\([^)]+\)|```|~~~|^\s*[-*]\s+", re.MULTILINE)
 MARKDOWN_TABLE_RE = re.compile(r"^\s*\|?.+\|.+\|?\s*\n\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$", re.MULTILINE)
@@ -50,6 +51,14 @@ def create_app(settings: Settings) -> FastAPI:
             content=_icon_png(),
             media_type="image/png",
             headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/static/jsdiff.min.js", include_in_schema=False)
+    def jsdiff() -> FileResponse:
+        return FileResponse(
+            STATIC_PATH / "jsdiff.min.js",
+            media_type="application/javascript",
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
         )
 
     @app.get("/")
@@ -158,6 +167,7 @@ def _script_json(value: str) -> str:
 
 
 def detect_content_kind(text: str) -> str:
+    text = text.lstrip("\ufeff")
     first_content_line = next(
         (line for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()),
         "",
