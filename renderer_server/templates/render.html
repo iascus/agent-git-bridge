@@ -204,10 +204,70 @@
         padding: 0;
       }
 
+      .markdown mjx-container {
+        max-width: 100%;
+      }
+
+      .markdown mjx-container[display="true"] {
+        overflow-x: auto;
+        overflow-y: hidden;
+        padding: 0.2em 0;
+      }
+
       .diff-view {
         overflow: auto;
         border: 0;
         border-radius: 0;
+      }
+
+      .diff-toc {
+        background: var(--code-bg);
+        border-bottom: 1px solid var(--border);
+        padding: 16px 20px 18px;
+      }
+
+      .diff-toc-heading {
+        align-items: baseline;
+        display: flex;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        font-size: 0.82rem;
+        font-weight: 700;
+        gap: 8px;
+        letter-spacing: 0.06em;
+        margin-bottom: 8px;
+        text-transform: uppercase;
+      }
+
+      .diff-toc-count {
+        color: var(--muted);
+        font-weight: 500;
+      }
+
+      .diff-toc ol {
+        column-gap: 28px;
+        columns: 280px;
+        list-style-position: inside;
+        margin: 0;
+        padding: 0;
+      }
+
+      .diff-toc li {
+        break-inside: avoid;
+        margin: 2px 0;
+      }
+
+      .diff-toc a {
+        color: inherit;
+        overflow-wrap: anywhere;
+        text-decoration-color: transparent;
+        text-underline-offset: 0.2em;
+        transition: color 120ms ease, text-decoration-color 120ms ease;
+      }
+
+      .diff-toc a:hover,
+      .diff-toc a:focus-visible {
+        color: var(--hunk-fg);
+        text-decoration-color: currentColor;
       }
 
       .diff-table {
@@ -258,6 +318,14 @@
         color: var(--hunk-fg);
         font-weight: 600;
       }
+
+      .diff-file-anchor {
+        scroll-margin-top: 12px;
+      }
+
+      .diff-file-anchor:target .diff-code {
+        box-shadow: inset 4px 0 0 currentColor;
+      }
     </style>
   </head>
   <body>
@@ -268,6 +336,18 @@
       </header>
       <section id="content" aria-live="polite"></section>
     </main>
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: { "[+]": [["$", "$"]] },
+          processEscapes: true
+        },
+        svg: {
+          fontCache: "global"
+        }
+      };
+    </script>
+    <script defer src="/static/mathjax.min.js"></script>
     <script src="/static/jsdiff.min.js"></script>
     <script>
       const contentElement = document.getElementById("content");
@@ -287,7 +367,7 @@
           .find((line) => line.trim() !== "") || "";
         if (/^(diff\b|---\s|\+\+\+\s|@@\s)/.test(firstContentLine)) return "diff";
 
-        if (/^#{1,6}\s|\[[^\]]+\]\([^)]+\)|```|~~~|^\s*[-*]\s+/m.test(normalizedText)) return "markdown";
+        if (/^#{1,6}\s|\[[^\]]+\]\([^)]+\)|```|~~~|^\s*[-*]\s+|\\\(|\\\[|\$\$/m.test(normalizedText)) return "markdown";
 
         return "text";
       }
@@ -506,6 +586,8 @@
         const lines = stripLeadingBom(text).replace(/\r\n?/g, "\n").split("\n");
         const lineTypes = buildDiffLineTypes(lines);
         const wordChanges = findWordChanges(lines, lineTypes);
+        const fileSections = findDiffFileSections(lines, lineTypes);
+        const sectionsByLine = new Map(fileSections.map((section) => [section.lineIndex, section]));
 
         lines.forEach((line, index) => {
           const row = document.createElement("tr");
@@ -526,13 +608,124 @@
           else if (lineTypes[index] === "hunk") row.classList.add("diff-hunk");
           else if (lineTypes[index] === "file") row.classList.add("diff-file");
 
+          const fileSection = sectionsByLine.get(index);
+          if (fileSection) {
+            row.id = fileSection.id;
+            row.classList.add("diff-file-anchor");
+          }
+
           row.append(code);
           tbody.append(row);
         });
 
         table.append(tbody);
+        const toc = renderDiffTableOfContents(fileSections);
+        if (toc) wrapper.append(toc);
         wrapper.append(table);
         return wrapper;
+      }
+
+      function normalizeDiffPath(path) {
+        let normalized = path.trim();
+        if (normalized.startsWith('"') && normalized.endsWith('"')) {
+          try {
+            normalized = JSON.parse(normalized);
+          } catch (_error) {
+            normalized = normalized.slice(1, -1);
+          }
+        }
+        return normalized.replace(/^[ab]\//, "");
+      }
+
+      function fileHeaderPath(line) {
+        const value = line.slice(4).split("\t", 1)[0].trim();
+        return normalizeDiffPath(value);
+      }
+
+      function diffCommandPath(line) {
+        if (line.startsWith("diff --git ")) {
+          const match = line.match(/^diff --git (?:"(?:\\.|[^"])*"|\S+) ("(?:\\.|[^"])*"|\S+)$/);
+          return match ? normalizeDiffPath(match[1]) : "Changed file";
+        }
+        return normalizeDiffPath(line.slice(5)) || "Changed file";
+      }
+
+      function findDiffFileSections(lines, lineTypes) {
+        const sections = [];
+        let pendingOld = null;
+        let sectionAwaitingHeaders = null;
+
+        const addSection = (lineIndex, filename, awaitingHeaders) => {
+          const section = {
+            id: `diff-file-${sections.length + 1}`,
+            lineIndex,
+            filename: filename || "Changed file"
+          };
+          sections.push(section);
+          sectionAwaitingHeaders = awaitingHeaders ? section : null;
+        };
+
+        lines.forEach((line, lineIndex) => {
+          if (/^diff\b/.test(line)) {
+            addSection(lineIndex, diffCommandPath(line), true);
+            pendingOld = null;
+            return;
+          }
+
+          if (line.startsWith("Index: ")) {
+            addSection(lineIndex, normalizeDiffPath(line.slice(7)), true);
+            pendingOld = null;
+            return;
+          }
+
+          if (lineTypes[lineIndex] === "file" && line.startsWith("--- ")) {
+            pendingOld = { lineIndex, filename: fileHeaderPath(line) };
+            return;
+          }
+
+          if (lineTypes[lineIndex] !== "file" || !line.startsWith("+++ ") || !pendingOld) return;
+
+          const newFilename = fileHeaderPath(line);
+          const filename = newFilename === "/dev/null" ? pendingOld.filename : newFilename;
+          if (sectionAwaitingHeaders) {
+            sectionAwaitingHeaders.filename = filename;
+            sectionAwaitingHeaders = null;
+          } else {
+            addSection(pendingOld.lineIndex, filename, false);
+          }
+          pendingOld = null;
+        });
+
+        return sections;
+      }
+
+      function renderDiffTableOfContents(fileSections) {
+        if (fileSections.length === 0) return null;
+
+        const nav = document.createElement("nav");
+        nav.className = "diff-toc";
+        nav.setAttribute("aria-label", "Changed files");
+
+        const heading = document.createElement("div");
+        heading.className = "diff-toc-heading";
+        heading.append(document.createTextNode("Changed files"));
+        const count = document.createElement("span");
+        count.className = "diff-toc-count";
+        count.textContent = String(fileSections.length);
+        heading.append(count);
+
+        const list = document.createElement("ol");
+        fileSections.forEach((section) => {
+          const item = document.createElement("li");
+          const link = document.createElement("a");
+          link.href = `#${section.id}`;
+          link.textContent = section.filename;
+          item.append(link);
+          list.append(item);
+        });
+
+        nav.append(heading, list);
+        return nav;
       }
 
       function tokenizeDiffText(text) {
@@ -689,14 +882,34 @@
             added.push(index++);
           }
 
-          const pairCount = Math.min(deleted.length, added.length);
-          for (let pair = 0; pair < pairCount; pair++) {
-            const result = diffWords(lines[deleted[pair]].slice(1), lines[added[pair]].slice(1));
-            changes.set(deleted[pair], result.oldResult);
-            changes.set(added[pair], result.newResult);
-          }
+          if (added.length === 0) continue;
+
+          const oldText = deleted.map((lineIndex) => lines[lineIndex].slice(1)).join("\n");
+          const newText = added.map((lineIndex) => lines[lineIndex].slice(1)).join("\n");
+          const result = diffWords(oldText, newText);
+          assignWordChangesToLines(result.oldResult, deleted, changes);
+          assignWordChangesToLines(result.newResult, added, changes);
         }
         return changes;
+      }
+
+      function assignWordChangesToLines(parts, lineIndexes, changes) {
+        const lineParts = lineIndexes.map(() => []);
+        let lineOffset = 0;
+
+        parts.forEach((part) => {
+          const segments = part.text.split("\n");
+          segments.forEach((segment, segmentIndex) => {
+            if (segment && lineOffset < lineParts.length) {
+              lineParts[lineOffset].push({ text: segment, changed: part.changed });
+            }
+            if (segmentIndex < segments.length - 1) lineOffset++;
+          });
+        });
+
+        lineIndexes.forEach((lineIndex, offset) => {
+          changes.set(lineIndex, lineParts[offset]);
+        });
       }
 
       function renderWordChanges(parts, kind) {

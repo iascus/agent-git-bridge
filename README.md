@@ -2,7 +2,7 @@
 
 A small FastAPI server for importing shared text, Markdown, or diff files from an iOS Shortcut and opening them in a private LAN renderer.
 
-The server keeps one current import. Each new `POST /import` overwrites the previous content, so render URLs do not contain IDs or other URL tokens. The renderer displays Markdown as HTML, unified diffs with row and word-level highlights, and plain text in a readable preformatted view.
+The server keeps one current import. Each new `POST /import` overwrites the previous content, so render URLs do not contain IDs or other URL tokens. The renderer displays Markdown as HTML, unified diffs with row and word-level highlights, and plain text in a readable preformatted view. Markdown math is rendered from TeX delimiters such as `\(...\)`, `\[...\]`, `$...$`, and `$$...$$`; the bundled renderer does not require internet access.
 
 This is a private intranet tool. It is not hardened for public internet exposure. Keep it on a trusted LAN or behind your own private network controls.
 

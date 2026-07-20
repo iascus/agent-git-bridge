@@ -55,6 +55,14 @@ def test_jsdiff_static_asset_is_served(client: TestClient) -> None:
     assert b"diffWordsWithSpace" in response.content
 
 
+def test_mathjax_static_asset_is_served(client: TestClient) -> None:
+    response = client.get("/static/mathjax.min.js")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/javascript")
+    assert b"MathJax" in response.content
+
+
 def test_import_rejects_wrong_token(client: TestClient) -> None:
     response = client.post(
         "/import",
@@ -241,6 +249,23 @@ def test_render_page_includes_markdown_table_of_contents_renderer(client: TestCl
     assert 'const importedKind = "markdown";' in response.text
 
 
+def test_render_page_includes_local_math_renderer(client: TestClient) -> None:
+    equation = r"A progress function \(\Delta_I(s) \geq 0\)."
+    client.post(
+        "/import",
+        content=equation,
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert 'const importedKind = "markdown";' in response.text
+    assert '<script defer src="/static/mathjax.min.js"></script>' in response.text
+    assert 'inlineMath: { "[+]": [["$", "$"]] }' in response.text
+    assert r"\\(\\Delta_I(s) \\geq 0\\)" in response.text
+
+
 def test_render_embeds_detected_diff_kind(client: TestClient) -> None:
     client.post(
         "/import",
@@ -301,6 +326,45 @@ def test_render_page_includes_word_level_diff_renderer(client: TestClient) -> No
     assert "function findWordChanges" in response.text
     assert "diff-word-add" in response.text
     assert "diff-word-del" in response.text
+
+
+def test_word_diff_compares_whole_replacement_groups(client: TestClient) -> None:
+    client.post(
+        "/import",
+        content=(
+            "--- a\n+++ b\n@@ -1,2 +1,3 @@\n"
+            "-B one\n-C one\n+A two\n+B two\n+C two"
+        ),
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert 'deleted.map((lineIndex) => lines[lineIndex].slice(1)).join("\\n")' in response.text
+    assert 'added.map((lineIndex) => lines[lineIndex].slice(1)).join("\\n")' in response.text
+    assert "function assignWordChangesToLines" in response.text
+    assert "lines[deleted[pair]]" not in response.text
+
+
+def test_diff_render_includes_linked_file_table_of_contents(client: TestClient) -> None:
+    client.post(
+        "/import",
+        content=(
+            "diff a.py\n--- a.py\n+++ a.py\n"
+            "diff b.py\n--- b.py\n+++ b.py"
+        ),
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert "function findDiffFileSections" in response.text
+    assert "function renderDiffTableOfContents" in response.text
+    assert 'nav.setAttribute("aria-label", "Changed files")' in response.text
+    assert "row.id = fileSection.id" in response.text
+    assert "diff-file-anchor:target" in response.text
 
 
 def test_diff_row_styles_do_not_color_unchanged_words_as_changed(client: TestClient) -> None:

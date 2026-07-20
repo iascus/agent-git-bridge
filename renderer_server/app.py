@@ -24,6 +24,7 @@ STATIC_PATH = Path(__file__).parent / "static"
 DIFF_START_RE = re.compile(r"^(diff\b|---\s|\+\+\+\s|@@\s)")
 MARKDOWN_RE = re.compile(r"^#{1,6}\s|\[[^\]]+\]\([^)]+\)|```|~~~|^\s*[-*]\s+", re.MULTILINE)
 MARKDOWN_TABLE_RE = re.compile(r"^\s*\|?.+\|.+\|?\s*\n\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$", re.MULTILINE)
+MARKDOWN_MATH_RE = re.compile(r"\\\(|\\\[|\$\$")
 ICON_PNG = None
 
 
@@ -57,6 +58,14 @@ def create_app(settings: Settings) -> FastAPI:
     def jsdiff() -> FileResponse:
         return FileResponse(
             STATIC_PATH / "jsdiff.min.js",
+            media_type="application/javascript",
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
+
+    @app.get("/static/mathjax.min.js", include_in_schema=False)
+    def mathjax() -> FileResponse:
+        return FileResponse(
+            STATIC_PATH / "mathjax.min.js",
             media_type="application/javascript",
             headers={"Cache-Control": "public, max-age=31536000, immutable"},
         )
@@ -174,7 +183,7 @@ def detect_content_kind(text: str) -> str:
     )
     if DIFF_START_RE.match(first_content_line):
         return "diff"
-    if MARKDOWN_RE.search(text) or MARKDOWN_TABLE_RE.search(text):
+    if MARKDOWN_RE.search(text) or MARKDOWN_TABLE_RE.search(text) or MARKDOWN_MATH_RE.search(text):
         return "markdown"
     return "text"
 
