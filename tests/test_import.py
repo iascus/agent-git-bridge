@@ -367,6 +367,45 @@ def test_diff_render_includes_linked_file_table_of_contents(client: TestClient) 
     assert "diff-file-anchor:target" in response.text
 
 
+def test_diff_table_of_contents_counts_added_and_deleted_lines_per_file(
+    client: TestClient,
+) -> None:
+    client.post(
+        "/import",
+        content="diff a\n@@ -1 +1 @@\n-old\n+new",
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert "section.addedLines = 0" in response.text
+    assert "section.deletedLines = 0" in response.text
+    assert 'lineTypes[lineIndex] === "add"' in response.text
+    assert 'lineTypes[lineIndex] === "del"' in response.text
+    assert 'lineCount.className = "diff-toc-line-count"' in response.text
+    assert '`+${section.addedLines}, -${section.deletedLines}`' in response.text
+
+
+def test_diff_table_of_contents_ignores_wrapper_command_before_first_file(
+    client: TestClient,
+) -> None:
+    client.post(
+        "/import",
+        content=(
+            "diff a b\ndiff a/f b/f\n--- a/f\n+++ b/f\n"
+            "@@ -1 +1 @@\n-x\n+y"
+        ),
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert "sectionAwaitingHeaders.lineIndex === lineIndex - 1" in response.text
+    assert "sections.pop()" in response.text
+
+
 def test_diff_row_styles_do_not_color_unchanged_words_as_changed(client: TestClient) -> None:
     client.post(
         "/import",

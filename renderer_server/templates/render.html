@@ -257,11 +257,21 @@
       }
 
       .diff-toc a {
+        align-items: baseline;
         color: inherit;
+        display: inline-flex;
+        gap: 8px;
         overflow-wrap: anywhere;
         text-decoration-color: transparent;
         text-underline-offset: 0.2em;
         transition: color 120ms ease, text-decoration-color 120ms ease;
+      }
+
+      .diff-toc-line-count {
+        color: var(--muted);
+        flex: none;
+        font-size: 0.82em;
+        white-space: nowrap;
       }
 
       .diff-toc a:hover,
@@ -600,7 +610,8 @@
             marker.textContent = line[0];
             code.append(marker, renderWordChanges(changes, line[0] === "+" ? "add" : "del"));
           } else {
-            code.textContent = line || " ";
+            const isContentLine = lineTypes[index] === "add" || lineTypes[index] === "del";
+            code.textContent = (isContentLine ? line : decodeDiffHeaderPaths(line)) || " ";
           }
 
           if (lineTypes[index] === "add") row.classList.add("diff-add");
@@ -625,16 +636,92 @@
         return wrapper;
       }
 
-      function normalizeDiffPath(path) {
-        let normalized = path.trim();
-        if (normalized.startsWith('"') && normalized.endsWith('"')) {
-          try {
-            normalized = JSON.parse(normalized);
-          } catch (_error) {
-            normalized = normalized.slice(1, -1);
+      const GIT_QUOTE_ESCAPES = {
+        a: "\x07",
+        b: "\b",
+        t: "\t",
+        n: "\n",
+        v: "\v",
+        f: "\f",
+        r: "\r",
+        '"': '"',
+        "\\": "\\"
+      };
+
+      // Git quotes paths containing non-ASCII or special characters, escaping
+      // every UTF-8 byte as an octal sequence, e.g. "caf\303\251.txt".
+      function unquoteGitPath(quoted) {
+        const body = quoted.slice(1, -1);
+        const parts = [];
+        let bytes = [];
+
+        const flushBytes = () => {
+          if (!bytes.length) return;
+          parts.push(new TextDecoder("utf-8").decode(new Uint8Array(bytes)));
+          bytes = [];
+        };
+
+        const pattern = /\\([0-7]{1,3})|\\(.)|[^\\]+|\\$/gsu;
+        let match;
+        while ((match = pattern.exec(body)) !== null) {
+          if (match[1] !== undefined) {
+            bytes.push(parseInt(match[1], 8) & 0xff);
+            continue;
+          }
+          flushBytes();
+          if (match[2] !== undefined) {
+            const escaped = GIT_QUOTE_ESCAPES[match[2]];
+            parts.push(escaped === undefined ? match[2] : escaped);
+          } else {
+            parts.push(match[0]);
           }
         }
+
+        flushBytes();
+        return parts.join("");
+      }
+
+      function normalizeDiffPath(path) {
+        let normalized = path.trim();
+        if (normalized.length > 1 && normalized.startsWith('"') && normalized.endsWith('"')) {
+          normalized = unquoteGitPath(normalized);
+        }
         return normalized.replace(/^[ab]\//, "");
+      }
+
+      const DIFF_PATH_ESCAPES = {
+        "\x07": "\\a",
+        "\b": "\\b",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\v": "\\v",
+        "\f": "\\f",
+        "\r": "\\r",
+        '"': '\\"',
+        "\\": "\\\\"
+      };
+
+      // Re-quote only what still needs it, so Unicode names stay readable.
+      function requoteDiffPath(path) {
+        if (!/[\s"\\\x00-\x1f\x7f]/.test(path)) return path;
+        const escaped = path.replace(
+          /[\x00-\x1f\x7f"\\]/gu,
+          (char) =>
+            DIFF_PATH_ESCAPES[char] ||
+            `\\${char.charCodeAt(0).toString(8).padStart(3, "0")}`
+        );
+        return `"${escaped}"`;
+      }
+
+      const DIFF_PATH_HEADER_PATTERN =
+        /^(?:diff\b|---|\+\+\+|Index: |rename (?:from|to) |copy (?:from|to) )/;
+
+      // Header lines carry git's octal-escaped paths verbatim; show them decoded.
+      function decodeDiffHeaderPaths(line) {
+        if (!DIFF_PATH_HEADER_PATTERN.test(line)) return line;
+        return line.replace(/"(?:\\.|[^"\\])*"/gsu, (quoted) =>
+          requoteDiffPath(unquoteGitPath(quoted))
+        );
       }
 
       function fileHeaderPath(line) {
@@ -667,6 +754,12 @@
 
         lines.forEach((line, lineIndex) => {
           if (/^diff\b/.test(line)) {
+            if (
+              sectionAwaitingHeaders &&
+              sectionAwaitingHeaders.lineIndex === lineIndex - 1
+            ) {
+              sections.pop();
+            }
             addSection(lineIndex, diffCommandPath(line), true);
             pendingOld = null;
             return;
@@ -696,6 +789,17 @@
           pendingOld = null;
         });
 
+        sections.forEach((section, index) => {
+          const nextSection = sections[index + 1];
+          const endLine = nextSection ? nextSection.lineIndex : lineTypes.length;
+          section.addedLines = 0;
+          section.deletedLines = 0;
+          for (let lineIndex = section.lineIndex; lineIndex < endLine; lineIndex++) {
+            if (lineTypes[lineIndex] === "add") section.addedLines++;
+            else if (lineTypes[lineIndex] === "del") section.deletedLines++;
+          }
+        });
+
         return sections;
       }
 
@@ -719,7 +823,12 @@
           const item = document.createElement("li");
           const link = document.createElement("a");
           link.href = `#${section.id}`;
-          link.textContent = section.filename;
+          const filename = document.createElement("span");
+          filename.textContent = section.filename;
+          const lineCount = document.createElement("span");
+          lineCount.className = "diff-toc-line-count";
+          lineCount.textContent = `+${section.addedLines}, -${section.deletedLines}`;
+          link.append(filename, lineCount);
           item.append(link);
           list.append(item);
         });
