@@ -254,7 +254,27 @@ sandboxing. See `SECURITY.md`.
 
 ## Snapshot export
 
-### Consistency model
+### Archive format (default)
+
+Each repository is exported as **one deterministic ZIP** with a stable name
+(`<key>-snapshot.zip`), containing `snapshot.json` and the selected files.
+The Drive file is updated in place (same file ID and name), so a single write
+switches readers from one commit to the next: there is no window in which
+files from two commits coexist, and no `updating` marker is needed. An
+unchanged commit and selection is detected by a content fingerprint and not
+re-uploaded. A large repository costs one upload instead of one request per
+file. Per-file exports left from the files format are trashed only after the
+ZIP is in place.
+
+### Selection
+
+With `export.manifest`, the repository's own manifest (e.g.
+`docs/design/MANIFEST.md`) defines the exported set (`project_source_files`)
+and bootstrap/lazy classes (`project_source_materialization`), read from the
+exported commit. Otherwise glob rules (`bootstrap`, `indexes`, `lazy`,
+`exclude`) apply.
+
+### Consistency model (files format)
 
 A snapshot is generated from Git objects of one resolved commit
 (`git ls-tree -r -z --long <sha>` + `git cat-file`), never from a working tree,
@@ -368,8 +388,8 @@ correctness, security or simplicity.
   next publication for that repository (worktree folders are named
   `<key>.<random>`; keys cannot contain `.`, so repositories never touch each
   other's folders).
-- The first export of a large repository can take minutes (one Drive API
-  call per file); later exports only upload changed blobs.
+- In the files format, the first export of a large repository takes minutes
+  (one Drive API call per file); the archive format needs one upload.
 
 ## Deployment
 

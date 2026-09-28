@@ -76,6 +76,20 @@ class SnapshotStore(ABC):
     def get_snapshot(self) -> dict[str, Any] | None:
         """Current ``snapshot.json`` content, or None."""
 
+    # Archive format ------------------------------------------------------
+
+    @abstractmethod
+    def put_archive(self, name: str, data: bytes, info: dict[str, str]) -> str:
+        """Create or replace (in place, same identity) the repository archive."""
+
+    @abstractmethod
+    def get_archive_info(self) -> dict[str, str] | None:
+        """Metadata recorded with the current archive (commit, fingerprint, …)."""
+
+    @abstractmethod
+    def remove_file_exports(self) -> int:
+        """Remove per-file exports and snapshot.json; return files removed."""
+
 
 def _atomic_write(target: Path, data: bytes) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -89,12 +103,37 @@ def _atomic_write(target: Path, data: bytes) -> None:
         raise
 
 
+ARCHIVE_INFO_NAME = ".gb-archive.json"
+
+
 class LocalDirectorySnapshotStore(SnapshotStore):
     """Exports into a local directory. For development, tests, or a folder
     synchronised by another tool."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
+
+    def put_archive(self, name: str, data: bytes, info: dict[str, str]) -> str:
+        previous = self.get_archive_info()
+        _atomic_write(self.root / name, data)
+        _atomic_write(self.root / ARCHIVE_INFO_NAME, json.dumps({**info, "name": name}).encode("utf-8"))
+        if previous and previous.get("name") not in (None, name):
+            (self.root / previous["name"]).unlink(missing_ok=True)
+        return name
+
+    def get_archive_info(self) -> dict[str, str] | None:
+        try:
+            return json.loads((self.root / ARCHIVE_INFO_NAME).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+
+    def remove_file_exports(self) -> int:
+        removed = 0
+        for path in self.existing_files():
+            self.delete_file(path)
+            removed += 1
+        (self.root / SNAPSHOT_NAME).unlink(missing_ok=True)
+        return removed
 
     def _target(self, path: str) -> Path:
         rel = check_relative_path(path)
@@ -108,11 +147,12 @@ class LocalDirectorySnapshotStore(SnapshotStore):
         found: dict[str, StoredFile] = {}
         if not self.root.exists():
             return found
+        info = self.get_archive_info() or {}
         for file in self.root.rglob("*"):
             if not file.is_file() or file.is_symlink():
                 continue
             rel = file.relative_to(self.root).as_posix()
-            if rel == SNAPSHOT_NAME or file.name.startswith(".gb-"):
+            if rel in (SNAPSHOT_NAME, info.get("name")) or file.name.startswith(".gb-"):
                 continue
             found[rel] = StoredFile(rel, rel, git_blob_sha1(file.read_bytes()))
         return found

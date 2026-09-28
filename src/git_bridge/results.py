@@ -89,6 +89,7 @@ class SnapshotInfo(BaseModel):
     generation_id: str | None = None
     generated_at: str | None = None
     file_count: int | None = None
+    archive: str | None = None
     error: str | None = None
 
 
@@ -115,12 +116,21 @@ class RefreshOutcome(BaseModel):
     unchanged: int = 0
     deleted: int = 0
     not_exported: int = 0
+    archive_name: str | None = None
+    archive_bytes: int | None = None
+    archive_sha256: str | None = None
     error: ErrorInfo | None = None
     message: str = ""
 
     def summarise(self) -> "RefreshOutcome":
         if self.error is not None:
             self.message = f"Snapshot refresh failed ({self.error.code}): {self.error.message}"
+        elif self.archive_name is not None:
+            state = "uploaded" if self.uploaded else "unchanged"
+            self.message = (
+                f"Snapshot of {self.repository}@{self.branch} at {(self.commit or '')[:12]}: "
+                f"{self.exported} file(s) in {self.archive_name} ({state})."
+            )
         else:
             self.message = (
                 f"Snapshot of {self.repository}@{self.branch} at {(self.commit or '')[:12]}: "

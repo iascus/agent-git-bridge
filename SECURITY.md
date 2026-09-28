@@ -90,8 +90,9 @@ configuration, and the patch is applied only in an isolated worktree.
 **Snapshots**
 
 - Built from Git objects of a single commit, never a working tree.
-- `snapshot.json` is marked `updating` before files change and written
-  `complete` last, so readers can detect in-flux states.
+- Archive format (default): one ZIP replaced in a single write, so readers
+  never see a mix of commits. Files format: `snapshot.json` is marked
+  `updating` before files change and written `complete` last.
 - Drive scope `drive.file`: the bridge cannot read or change any file it did
   not create. Removed files go to the Drive trash (recoverable).
 - Only text files are exported; binaries, symlinks and oversized files are

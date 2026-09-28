@@ -43,7 +43,7 @@ from .results import (
     SnapshotInfo,
     ValidationReport,
 )
-from .snapshot import build_snapshot, export_snapshot
+from .snapshot import build_snapshot, export_archive, export_snapshot
 from .store import SnapshotStore
 
 StoreFactory = Callable[["Repository"], SnapshotStore]
@@ -155,19 +155,37 @@ class Repository:
         if self.config.export is not None and self.store_factory is not None:
             status.export_branch = self.config.export_branch
             try:
-                current = self.store_factory(self).get_snapshot() or {}
-                status.snapshot = SnapshotInfo(
-                    state=current.get("state"),
-                    commit=current.get("commit") or current.get("target_commit"),
-                    generation_id=current.get("generation_id"),
-                    generated_at=current.get("generated_at"),
-                    file_count=(current.get("counts") or {}).get("exported"),
-                )
+                store = self.store_factory(self)
+                if self.config.export.format == "archive":
+                    info = store.get_archive_info() or {}
+                    files = info.get("files", "")
+                    status.snapshot = SnapshotInfo(
+                        state="complete" if info else None,
+                        commit=info.get("commit"),
+                        generation_id=info.get("generation_id"),
+                        generated_at=info.get("generated_at"),
+                        file_count=int(files) if files.isdigit() else None,
+                        archive=info.get("name"),
+                    )
+                else:
+                    current = store.get_snapshot() or {}
+                    status.snapshot = SnapshotInfo(
+                        state=current.get("state"),
+                        commit=current.get("commit") or current.get("target_commit"),
+                        generation_id=current.get("generation_id"),
+                        generated_at=current.get("generated_at"),
+                        file_count=(current.get("counts") or {}).get("exported"),
+                    )
             except Exception as exc:  # status must still report Git state
                 status.snapshot = SnapshotInfo(error=f"{type(exc).__name__}: {str(exc)[:300]}")
         return status
 
     # --------------------------------------------------------------- snapshot
+
+    @property
+    def archive_name(self) -> str:
+        export = self.config.export
+        return (export.archive_name if export and export.archive_name else f"{self.key}-snapshot.zip")
 
     def _store(self) -> SnapshotStore:
         if self.config.export is None:
@@ -206,7 +224,10 @@ class Repository:
                     export=self.config.export,
                 )
             with self.export_lock:
-                result = export_snapshot(store, build)
+                if self.config.export.format == "archive":
+                    result = export_archive(store, build, self.archive_name)
+                else:
+                    result = export_snapshot(store, build)
             m = result.manifest
             outcome.ok = True
             outcome.commit = target
@@ -216,6 +237,9 @@ class Repository:
             outcome.exported = m["counts"]["exported"]
             outcome.not_exported = m["counts"]["listed"] - m["counts"]["exported"]
             outcome.uploaded, outcome.unchanged, outcome.deleted = result.uploaded, result.unchanged, result.deleted
+            outcome.archive_name = result.archive_name
+            outcome.archive_bytes = result.archive_bytes
+            outcome.archive_sha256 = result.archive_sha256
         except BridgeError as exc:
             outcome.error = _error_info(exc)
         self.events.emit(

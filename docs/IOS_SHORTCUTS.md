@@ -94,10 +94,8 @@ elsewhere, or after a publication reported `snapshot_refresh: failed`).
    <message>
    ```
 
-The first export of a large repository can take several minutes; run it once
-from the host (`git-bridge refresh rot3k`) so the Shortcut only ever does
-incremental updates. If the Shortcut times out, the export continues on the
-server; run it again (or check `…/status`) to see the result.
+With the archive format a refresh is one ZIP upload (seconds for a few MB), and
+it is skipped entirely when nothing changed.
 
 ## End-to-end test
 
@@ -106,7 +104,8 @@ server; run it again (or check `…/status`) to see the result.
 2. Share the ZIP → **Publish Git Patch**. Expect `Published …` with a commit
    SHA.
 3. Confirm the commit on GitHub (`design-docs` branch) and that
-   `ChatGPT/<repo>/snapshot.json` in Drive shows the new `commit`.
+   `ChatGPT/<repo>/<repo>-snapshot.zip` in Drive was updated and its
+   `snapshot.json` shows the new `commit`.
 4. Share the **same** ZIP again. Expect
    `Rejected (remote_changed): …` — the optimistic-concurrency check.
 5. Turn Tailscale off on the phone and run the Shortcut again. It must fail to

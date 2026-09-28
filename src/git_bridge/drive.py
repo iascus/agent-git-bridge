@@ -41,7 +41,9 @@ class DriveApi(Protocol):
     def create_folder(self, name: str, parent_id: str, props: dict[str, str]) -> str: ...
     def list_files(self, props: dict[str, str]) -> list[DriveFile]: ...
     def create_file(self, name: str, parent_id: str, content: bytes, mime_type: str, props: dict[str, str]) -> str: ...
-    def update_file(self, file_id: str, content: bytes, mime_type: str, props: dict[str, str]) -> None: ...
+    def update_file(
+        self, file_id: str, content: bytes, mime_type: str, props: dict[str, str], name: str | None = None
+    ) -> None: ...
     def trash_file(self, file_id: str) -> None: ...
     def download(self, file_id: str) -> bytes: ...
 
@@ -164,6 +166,49 @@ class GoogleDriveSnapshotStore(SnapshotStore):
             return None
         return json.loads(self.api.download(snapshot_id).decode("utf-8"))
 
+    # Archive format ------------------------------------------------------
+
+    def _find_archive(self) -> DriveFile | None:
+        matches = self.api.list_files(self._props("archive"))
+        for extra in matches[1:]:  # left by an interrupted run
+            self.api.trash_file(extra.id)
+        return matches[0] if matches else None
+
+    def put_archive(self, name: str, data: bytes, info: dict[str, str]) -> str:
+        props = self._props("archive", **{f"gb_{k}": v for k, v in info.items()})
+        current = self._find_archive()
+        if current is not None:
+            # Same Drive file: stable ID and name, content replaced in one write.
+            self.api.update_file(current.id, data, "application/zip", props, name=name)
+            return current.id
+        return self.api.create_file(name, self._folder(""), data, "application/zip", props)
+
+    def get_archive_info(self) -> dict[str, str] | None:
+        current = self._find_archive()
+        if current is None:
+            return None
+        info = {k[3:]: v for k, v in current.app_properties.items() if k.startswith("gb_")}
+        info["name"] = current.name
+        return info
+
+    def remove_file_exports(self) -> int:
+        removed = 0
+        for f in self.api.list_files(self._props("file")):
+            self.api.trash_file(f.id)
+            removed += 1
+        for f in self.api.list_files(self._props("snapshot")):
+            self.api.trash_file(f.id)
+        self._snapshot_id = None
+        self._files = {}
+        # Sub-folders created for per-file exports; keep the drive_root chain.
+        self._folder("")
+        keep = {fid for path, fid in self._folders.items() if (self.drive_root + "/").startswith(path + "/")}
+        for f in self.api.list_files(self._props("folder")):
+            if f.id not in keep:
+                self.api.trash_file(f.id)
+        self._folders = {k: v for k, v in self._folders.items() if v in keep}
+        return removed
+
 
 # ------------------------------------------------------- real Drive client
 
@@ -183,7 +228,9 @@ class GoogleDriveApi:
     def _media(self, content: bytes, mime_type: str):
         from googleapiclient.http import MediaIoBaseUpload
 
-        return MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+        # Resumable uploads for large archives survive transient failures.
+        resumable = len(content) > 5 * 1024 * 1024
+        return MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=resumable)
 
     def find_folder(self, name: str, parent_id: str) -> str | None:
         q = (
@@ -222,10 +269,13 @@ class GoogleDriveApi:
         req = self.files.create(body=body, media_body=self._media(content, mime_type), fields="id")
         return req.execute(num_retries=self.RETRIES)["id"]
 
-    def update_file(self, file_id: str, content: bytes, mime_type: str, props: dict[str, str]) -> None:
-        req = self.files.update(
-            fileId=file_id, body={"appProperties": props}, media_body=self._media(content, mime_type), fields="id"
-        )
+    def update_file(
+        self, file_id: str, content: bytes, mime_type: str, props: dict[str, str], name: str | None = None
+    ) -> None:
+        body: dict[str, Any] = {"appProperties": props}
+        if name is not None:
+            body["name"] = name
+        req = self.files.update(fileId=file_id, body=body, media_body=self._media(content, mime_type), fields="id")
         req.execute(num_retries=self.RETRIES)
 
     def trash_file(self, file_id: str) -> None:

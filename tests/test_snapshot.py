@@ -14,6 +14,7 @@ from git_bridge.store import FileMetadata, LocalDirectorySnapshotStore, Snapshot
 
 EXPORT = ExportConfig(
     drive_root="ChatGPT/rot3k",
+    format="files",
     bootstrap=["MANIFEST.md", "docs/**/*.md"],
     indexes=["characters/index*.json"],
     lazy=["characters/**/*.md", "records/**/*.md", "assets/**"],
@@ -48,6 +49,17 @@ class RecordingStore(SnapshotStore):
 
     def get_snapshot(self):
         return self.inner.get_snapshot()
+
+    def put_archive(self, name, data, info):
+        self.ops.append(("put_archive", name))
+        return self.inner.put_archive(name, data, info)
+
+    def get_archive_info(self):
+        return self.inner.get_archive_info()
+
+    def remove_file_exports(self):
+        self.ops.append(("remove_file_exports", ""))
+        return self.inner.remove_file_exports()
 
 
 class FailingStore(RecordingStore):
@@ -388,7 +400,9 @@ def _commit(env: GitEnv, edits: dict) -> str:
 @pytest.fixture
 def manifestenv(snapenv: GitEnv) -> GitEnv:
     snapenv.with_repo_config(
-        export=ExportConfig(drive_root="ChatGPT/rot3k", manifest="docs/design/MANIFEST.md", exclude=["records/private-*"])
+        export=ExportConfig(
+            drive_root="ChatGPT/rot3k", format="files", manifest="docs/design/MANIFEST.md", exclude=["records/private-*"]
+        )
     )
     _commit(snapenv, {"docs/design/MANIFEST.md": MANIFEST_MD})
     return snapenv

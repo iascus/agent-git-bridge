@@ -1,7 +1,10 @@
 """Snapshot generation (from Git objects of exactly one commit) and
 consistent export to a SnapshotStore.
 
-Export protocol:
+Archive format (default): one deterministic ZIP per repository containing
+snapshot.json and the selected files, replaced in place in a single write.
+
+Files format:
   1. write snapshot.json with state "updating" (readers must not trust files)
   2. upload changed files in place, remove files no longer exported
   3. write the final snapshot.json with state "complete"  -- always last
@@ -9,8 +12,12 @@ Export protocol:
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import mimetypes
 import secrets
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -247,6 +254,94 @@ class ExportResult:
     uploaded: int = 0
     unchanged: int = 0
     deleted: int = 0
+    archive_name: str | None = None
+    archive_bytes: int | None = None
+    archive_sha256: str | None = None
+
+
+ARCHIVE_READER_NOTES = (
+    "Exact export of one Git commit as a single ZIP, replaced atomically. "
+    "Unzip it; this snapshot.json describes every file in the archive. Read "
+    "bootstrap files at conversation start and lazy files only when needed. "
+    "To propose changes, build publish.zip against 'commit' as expected_base_sha."
+)
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+
+
+def archive_fingerprint(manifest: dict[str, Any]) -> str:
+    """Identifies archive content independent of generation time."""
+    material = {
+        "commit": manifest["commit"],
+        "selection": manifest.get("selection"),
+        "files": {
+            p: [f["blob_sha"], f["class"], f.get("lazy_class"), f["exported"], f.get("reason")]
+            for p, f in manifest["files"].items()
+        },
+    }
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def build_archive(manifest: dict[str, Any], contents: dict[str, bytes]) -> bytes:
+    """Deterministic ZIP: fixed timestamps and permissions, sorted entries."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+
+        def add(name: str, data: bytes) -> None:
+            info = zipfile.ZipInfo(name, date_time=_ZIP_EPOCH)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            zf.writestr(info, data)
+
+        add(SNAPSHOT_NAME, json.dumps(manifest, indent=2, ensure_ascii=False).encode("utf-8") + b"\n")
+        for path in sorted(contents):
+            add(path, contents[path])
+    return buf.getvalue()
+
+
+def export_archive(store: SnapshotStore, build: SnapshotBuild, name: str) -> ExportResult:
+    manifest = dict(build.manifest)
+    manifest["reader_notes"] = ARCHIVE_READER_NOTES
+    manifest.pop("snapshot_file", None)
+    manifest["archive"] = name
+    try:
+        info = store.get_archive_info() or {}
+        manifest["previous_commit"] = info.get("commit")
+        fingerprint = archive_fingerprint(manifest)
+        result = ExportResult(manifest=manifest, archive_name=name)
+        if info.get("fingerprint") == fingerprint and info.get("name") == name:
+            result.unchanged = 1
+            manifest["generation_id"] = info.get("generation_id", manifest["generation_id"])
+            manifest["generated_at"] = info.get("generated_at")
+            result.archive_sha256 = info.get("sha256")
+            result.archive_bytes = int(info["bytes"]) if info.get("bytes", "").isdigit() else None
+        else:
+            manifest["generated_at"] = utc_now()
+            data = build_archive(manifest, build.contents)
+            digest = hashlib.sha256(data).hexdigest()
+            store.put_archive(
+                name,
+                data,
+                {
+                    "commit": manifest["commit"],
+                    "fingerprint": fingerprint,
+                    "generation_id": manifest["generation_id"],
+                    "generated_at": manifest["generated_at"],
+                    "sha256": digest,
+                    "bytes": str(len(data)),
+                    "files": str(len(build.contents)),
+                    "branch": manifest["branch"],
+                },
+            )
+            result.uploaded = 1
+            result.archive_sha256 = digest
+            result.archive_bytes = len(data)
+        # Only after the archive is in place: drop artefacts of the files format.
+        result.deleted = store.remove_file_exports()
+        return result
+    except SnapshotError:
+        raise
+    except Exception as exc:  # transport failures (HTTP, auth, disk)
+        raise SnapshotError(f"snapshot export failed: {type(exc).__name__}: {str(exc)[:500]}") from exc
 
 
 def _previous_commit(store: SnapshotStore) -> str | None:

@@ -66,6 +66,11 @@ class ExportConfig(_Strict):
     # defines the exported file set (and whose optional materialization block
     # defines bootstrap/lazy). Mutually exclusive with bootstrap/lazy/indexes.
     manifest: str | None = None
+    # "archive": one ZIP per repository, replaced in place under a stable
+    # name (default "<key>-snapshot.zip") -- atomic for readers.
+    # "files": every file individually plus snapshot.json.
+    format: Literal["archive", "files"] = "archive"
+    archive_name: str | None = None
     bootstrap: list[str] = Field(default_factory=list)
     lazy: list[str] = Field(default_factory=list)
     indexes: list[str] = Field(default_factory=list)
@@ -80,6 +85,13 @@ class ExportConfig(_Strict):
         if not v.strip("/") or any(p in ("", ".", "..") for p in parts):
             raise ValueError(f"invalid drive_root {v!r}")
         return "/".join(parts)
+
+    @field_validator("archive_name")
+    @classmethod
+    def _check_archive_name(cls, v: str | None) -> str | None:
+        if v is not None and (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}\.zip", v)):
+            raise ValueError(f"archive_name {v!r} must be a plain file name ending in .zip")
+        return v
 
     @model_validator(mode="after")
     def _one_selection_method(self) -> "ExportConfig":

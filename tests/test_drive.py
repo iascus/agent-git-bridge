@@ -59,10 +59,12 @@ class FakeDriveApi:
         self.items[fid] = dict(name=name, parent=parent_id, folder=False, props=dict(props), trashed=False, content=content, mime=mime_type)
         return fid
 
-    def update_file(self, file_id, content, mime_type, props):
+    def update_file(self, file_id, content, mime_type, props, name=None):
         self.calls.append("update_file")
         it = self.items[file_id]
         it.update(content=content, mime=mime_type)
+        if name is not None:
+            it["name"] = name
         it["props"].update(props)
 
     def trash_file(self, file_id):
@@ -86,7 +88,7 @@ class FakeDriveApi:
 
 
 EXPORT = ExportConfig(
-    drive_root="ChatGPT/rot3k", bootstrap=["MANIFEST.md", "docs/**/*.md"], lazy=["records/**/*.md"]
+    drive_root="ChatGPT/rot3k", format="files", bootstrap=["MANIFEST.md", "docs/**/*.md"], lazy=["records/**/*.md"]
 )
 
 

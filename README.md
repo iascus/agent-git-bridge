@@ -2,9 +2,11 @@
 
 A small, security-conscious bridge between an AI conversation and Git:
 
-- **Pull.** Exports an exact Git commit of configured repositories to Google
-  Drive, file by file, with a `snapshot.json` manifest. ChatGPT reads it
-  through its normal Drive integration.
+- **Pull.** Exports an exact Git commit of each configured repository to
+  Google Drive as one ZIP with a stable name (e.g.
+  `ChatGPT/rot3k/rot3k-snapshot.zip`), replaced in place, containing a
+  `snapshot.json` manifest and the files selected by the repository's own
+  source manifest. ChatGPT reads it through its normal Drive integration.
 - **Push.** ChatGPT produces a `publish.zip` (`request.json` +
   `changes.patch`). You share it from the iOS Share Sheet to a Shortcut, which
   POSTs it over private Tailscale HTTPS. The bridge verifies the expected base

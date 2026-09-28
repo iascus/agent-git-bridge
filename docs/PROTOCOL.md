@@ -6,7 +6,36 @@ produces (push). Both are versioned with `format_version`.
 
 ## Pull: the Drive snapshot
 
-Layout in Google Drive, per repository:
+### Archive format (default)
+
+One ZIP per repository with a **stable name**, replaced in place (same Drive
+file ID) in a single write, so a reader always gets one complete commit:
+
+```text
+My Drive/
+└── ChatGPT/rot3k/
+    └── rot3k-snapshot.zip         name: export.archive_name, default <key>-snapshot.zip
+        ├── snapshot.json          first entry; describes every file in the ZIP
+        ├── AGENTS.md              selected files at their repository paths
+        ├── docs/design/MANIFEST.md
+        └── …
+```
+
+- The ZIP is deterministic (fixed timestamps, sorted entries). If commit and
+  file selection are unchanged, it is not re-uploaded.
+- `snapshot.json` inside the ZIP has the schema below with `state:
+  "complete"` (always), `"archive": "<name>"`, and no `drive_file_id`s.
+- Drive `appProperties` of the ZIP (private to the bridge) record commit,
+  generation ID, SHA-256, size and a content fingerprint.
+- Switching from the files format moves the per-file exports to the Drive
+  trash after the ZIP has been written.
+
+Reader: download the ZIP, unzip, read `snapshot.json`, then the `bootstrap`
+files; open `lazy` files from the unzipped tree when needed.
+
+### Files format (`export.format: files`)
+
+Every selected file individually, plus `snapshot.json`:
 
 ```text
 My Drive/
@@ -105,7 +134,7 @@ While an export runs, `snapshot.json` is replaced by a marker:
 3. Read `lazy` files only when the task needs them.
 4. Use `commit` as `expected_base_sha` when proposing changes.
 
-### Export order
+### Export order (files format)
 
 1. Write `snapshot.json` with `state: updating`.
 2. Upload new/changed files in place (unchanged blob SHA ⇒ skipped); move
@@ -220,11 +249,13 @@ Every validate/publish response is one JSON object:
 
 Paste into the ChatGPT project instructions (adjust names):
 
-> **Reading the repository.** The repository is mirrored in Google Drive under
-> `ChatGPT/<repo>/`. Always read `ChatGPT/<repo>/snapshot.json` first. If its
-> `state` is not `complete`, tell me and stop. Then read every file whose
-> `class` is `bootstrap` or `index`. Read `lazy` files only when needed. Treat
-> `commit` as the exact version you are looking at.
+> **Reading the repository.** The repository snapshot is the Google Drive file
+> `ChatGPT/<repo>/<repo>-snapshot.zip`. Download it and unzip it with Python.
+> Read `snapshot.json` inside it first: `commit` is the exact version you are
+> looking at. Then read every file whose `class` is `bootstrap`. Read `lazy`
+> files from the unzipped tree only when a task needs them. Never mix files
+> from different ZIP downloads; if you fetch the ZIP again, re-read
+> `snapshot.json`.
 >
 > **Proposing changes.** Never claim to have committed anything. When I ask you
 > to publish, produce one file `<repo>-publish.zip` containing exactly:
