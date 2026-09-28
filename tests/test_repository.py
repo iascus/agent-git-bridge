@@ -7,7 +7,7 @@ import pytest
 
 from conftest import BRANCH, GitEnv, git
 from git_bridge.config import ValidationCommand
-from git_bridge.errors import ConfigError, NotAllowed
+from git_bridge.errors import ConfigError, NotAllowed, UnknownRepository
 from git_bridge.gitcmd import github_auth_env
 from git_bridge.repository import Repository
 
@@ -145,7 +145,7 @@ def test_disallowed_repository_in_request(gitenv: GitEnv):
 
 
 def test_unknown_repository_key(gitenv: GitEnv):
-    with pytest.raises(NotAllowed):
+    with pytest.raises(UnknownRepository):
         gitenv.bridge.repository("other")
 
 

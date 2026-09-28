@@ -1,8 +1,23 @@
-# Example configuration. Copy to config/local.yaml (git-ignored) and edit.
+# Example configuration for a Linux host (systemd); for Windows see
+# example.windows.yaml. Copy to /etc/git-bridge/config.yaml and edit.
 # Only repositories and branches listed here can ever be touched.
+# Secrets are separate files referenced by path, never stored in Git.
 
-work_dir: /srv/git-bridge/work          # temporary publication worktrees
-github_token_file: /etc/git-bridge/github-token   # optional; outside the repo, mode 0600
+work_dir: /var/lib/git-bridge/work             # temporary publication worktrees
+audit_log: /var/lib/git-bridge/audit.jsonl     # append-only JSON Lines
+github_token_file: /etc/git-bridge/github-token   # fine-grained PAT, mode 0600
+
+server:
+  host: 127.0.0.1                  # loopback only; Tailscale Serve provides HTTPS
+  port: 8000
+  bearer_token_file: /etc/git-bridge/bearer-token
+
+snapshot:
+  transport: google_drive          # or: local (with local_root), none
+
+google:
+  client_secrets_file: /etc/git-bridge/google-client.json
+  token_file: /var/lib/git-bridge/google-token.json
 
 git_identity:
   name: Git Bridge
@@ -25,7 +40,7 @@ repositories:
     # artifacts naming rt3k are still accepted, and the clone is re-pointed.
     github_repo: iascus/rt3k
     former_github_repos: []
-    local_path: /srv/git-bridge/repos/rot3k   # persistent bare clone
+    local_path: /var/lib/git-bridge/repos/rot3k   # persistent bare clone
     remote: origin
     # remote_url defaults to https://github.com/<github_repo>.git
 
@@ -61,7 +76,7 @@ repositories:
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
-    local_path: /srv/git-bridge/repos/cyberpunk-tactics
+    local_path: /var/lib/git-bridge/repos/cyberpunk-tactics
     allowed_branches:
       - design-docs
     denied_paths:

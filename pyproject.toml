@@ -12,10 +12,18 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.5",
     "PyYAML>=6",
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "google-api-python-client>=2.100",
+    "google-auth>=2.20",
+    "google-auth-oauthlib>=1.2",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+git-bridge = "git_bridge.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -23,3 +31,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient`"]

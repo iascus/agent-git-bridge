@@ -3,8 +3,6 @@ validate/publish pipeline running in an isolated temporary worktree."""
 
 from __future__ import annotations
 
-import json
-import logging
 import shutil
 import subprocess
 import tempfile
@@ -12,7 +10,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 from . import pathglob
 from .artifact import PublishArtifact, PublishRequest
@@ -27,8 +25,12 @@ from .errors import (
     PushRace,
     PushRejected,
     RemoteChanged,
+    SnapshotError,
+    SnapshotNotConfigured,
+    UnknownRepository,
     ValidationFailed,
 )
+from .events import EventLog
 from .gitcmd import Git, github_auth_env, minimal_env, tail
 from .results import (
     BranchStatus,
@@ -36,19 +38,23 @@ from .results import (
     CheckResult,
     ErrorInfo,
     PublishOutcome,
+    RefreshOutcome,
     RepositoryStatus,
+    SnapshotInfo,
     ValidationReport,
 )
+from .snapshot import build_snapshot, export_snapshot
+from .store import SnapshotStore
 
-log = logging.getLogger("git_bridge")
+StoreFactory = Callable[["Repository"], SnapshotStore]
 
 REGULAR_FILE_MODES = frozenset({"100644", "100755", "000000"})
 _PUSH_RACE_REASONS = ("non-fast-forward", "fetch first", "stale info", "already exists")
 VALIDATION_OUTPUT_TAIL = 4000
 
 
-def log_event(event: str, **fields: object) -> None:
-    log.info(json.dumps({"event": event, **fields}, sort_keys=True, default=str))
+def _error_info(exc: BridgeError) -> ErrorInfo:
+    return ErrorInfo(code=exc.code, message=exc.message, http_status=exc.http_status, details=exc.details)
 
 
 def normalise_commit_message(message: str) -> str:
@@ -57,12 +63,28 @@ def normalise_commit_message(message: str) -> str:
 
 
 class Repository:
-    def __init__(self, key: str, config: RepositoryConfig, settings: Settings) -> None:
+    def __init__(
+        self,
+        key: str,
+        config: RepositoryConfig,
+        settings: Settings,
+        *,
+        events: EventLog | None = None,
+        store_factory: StoreFactory | None = None,
+    ) -> None:
         self.key = key
         self.config = config
         self.settings = settings
-        self.git = Git(config.local_path, timeout=settings.git_timeout_seconds)
+        self.events = events or EventLog()
+        self.store_factory = store_factory
+        self.git = Git(
+            config.local_path, timeout=settings.git_timeout_seconds, extra_config=settings.git_extra_config
+        )
+        # Git operations on this repository's clone are serialised...
         self.lock = threading.Lock()
+        # ...and so are snapshot exports, separately, so a slow Drive upload
+        # never blocks a publication.
+        self.export_lock = threading.Lock()
 
     # ------------------------------------------------------------------ setup
 
@@ -85,9 +107,9 @@ class Repository:
         remote = self.config.remote
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            Git(path.parent).run(["init", "--bare", "--quiet", str(path)])
+            self.git.at(path.parent).run(["init", "--bare", "--quiet", str(path)])
             self.git.run(["remote", "add", remote, url])
-            log_event("clone_initialised", repo=self.key)
+            self.events.emit("clone_initialised", repo=self.key)
             return
         try:
             is_bare = self.git.text(["rev-parse", "--is-bare-repository"])
@@ -99,7 +121,7 @@ class Repository:
         if actual_url in self.config.former_remote_urls:
             # Declared GitHub rename: follow it rather than relying on redirects.
             self.git.run(["remote", "set-url", remote, url])
-            log_event("clone_remote_renamed", repo=self.key, old=actual_url, new=url)
+            self.events.emit("clone_remote_renamed", repo=self.key, old=actual_url, new=url)
         elif actual_url != url:
             raise ConfigError(
                 f"local clone for {self.key!r} points at a different remote URL; "
@@ -129,7 +151,114 @@ class Repository:
                     branches.append(BranchStatus(branch=branch, remote_sha=self.fetch(branch)))
                 except GitError as exc:
                     branches.append(BranchStatus(branch=branch, remote_sha=None, error=exc.message))
-        return RepositoryStatus(repository=self.config.github_repo, key=self.key, branches=branches)
+        status = RepositoryStatus(repository=self.config.github_repo, key=self.key, branches=branches)
+        if self.config.export is not None and self.store_factory is not None:
+            status.export_branch = self.config.export_branch
+            try:
+                current = self.store_factory(self).get_snapshot() or {}
+                status.snapshot = SnapshotInfo(
+                    state=current.get("state"),
+                    commit=current.get("commit") or current.get("target_commit"),
+                    generation_id=current.get("generation_id"),
+                    generated_at=current.get("generated_at"),
+                    file_count=(current.get("counts") or {}).get("exported"),
+                )
+            except Exception as exc:  # status must still report Git state
+                status.snapshot = SnapshotInfo(error=f"{type(exc).__name__}: {str(exc)[:300]}")
+        return status
+
+    # --------------------------------------------------------------- snapshot
+
+    def _store(self) -> SnapshotStore:
+        if self.config.export is None:
+            raise SnapshotNotConfigured("repository has no export configuration")
+        if self.store_factory is None:
+            raise SnapshotNotConfigured("no snapshot transport is configured")
+        try:
+            return self.store_factory(self)
+        except BridgeError:
+            raise
+        except Exception as exc:
+            raise SnapshotError(f"cannot open snapshot store: {type(exc).__name__}: {str(exc)[:300]}") from exc
+
+    def refresh(self, *, commit: str | None = None) -> RefreshOutcome:
+        """Export the configured branch (or ``commit``, which must be on it)."""
+        branch = self.config.export_branch
+        outcome = RefreshOutcome(repository=self.config.github_repo, key=self.key, branch=branch)
+        started = time.monotonic()
+        try:
+            store = self._store()
+            with self.lock:
+                self.ensure_clone()
+                head = self.fetch(branch)
+                target = commit or head
+                if commit is not None:
+                    # Only export commits that really are part of the remote branch.
+                    reachable = self.git.run(["merge-base", "--is-ancestor", commit, head], check=False)
+                    if reachable.returncode != 0:
+                        raise SnapshotError("commit is not on the remote branch", commit=commit, head=head)
+                build = build_snapshot(
+                    self.git,
+                    commit=target,
+                    repository=self.config.github_repo,
+                    repository_key=self.key,
+                    branch=branch,
+                    export=self.config.export,
+                )
+            with self.export_lock:
+                result = export_snapshot(store, build)
+            m = result.manifest
+            outcome.ok = True
+            outcome.commit = target
+            outcome.previous_commit = m["previous_commit"]
+            outcome.generation_id = m["generation_id"]
+            outcome.file_count = m["counts"]["listed"]
+            outcome.exported = m["counts"]["exported"]
+            outcome.not_exported = m["counts"]["listed"] - m["counts"]["exported"]
+            outcome.uploaded, outcome.unchanged, outcome.deleted = result.uploaded, result.unchanged, result.deleted
+        except BridgeError as exc:
+            outcome.error = _error_info(exc)
+        self.events.emit(
+            "refresh",
+            repo=self.key,
+            repository=self.config.github_repo,
+            branch=branch,
+            commit=outcome.commit,
+            generation_id=outcome.generation_id,
+            ok=outcome.ok,
+            error=outcome.error.code if outcome.error else None,
+            error_message=outcome.error.message if outcome.error else None,
+            exported=outcome.exported,
+            uploaded=outcome.uploaded,
+            deleted=outcome.deleted,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+        return outcome.summarise()
+
+    def publish_and_refresh(self, artifact: PublishArtifact) -> PublishOutcome:
+        """Publish, then export the newly published commit. A snapshot
+        failure is reported but never turns a successful push into a failure."""
+        outcome = self.publish(artifact)
+        if not outcome.ok or outcome.new_sha is None:
+            return outcome
+        if self.config.export is None or self.store_factory is None:
+            outcome.snapshot_refresh = "not_configured"
+            return outcome.summarise()
+        refreshed = self.refresh(commit=outcome.new_sha)
+        if refreshed.ok:
+            outcome.snapshot_refresh = "success"
+            outcome.snapshot_commit = refreshed.commit
+        else:
+            outcome.snapshot_refresh = "failed"
+            outcome.snapshot_error = refreshed.error.message if refreshed.error else "unknown error"
+        self.events.emit(
+            "publish_snapshot",
+            repo=self.key,
+            new_sha=outcome.new_sha,
+            snapshot_refresh=outcome.snapshot_refresh,
+            snapshot_error=outcome.snapshot_error,
+        )
+        return outcome.summarise()
 
     # --------------------------------------------------------------- pipeline
 
@@ -171,7 +300,7 @@ class Repository:
                         observed=observed,
                     )
                 with self._worktree(req.expected_base_sha) as wt:
-                    wt_git = Git(wt, timeout=self.settings.git_timeout_seconds)
+                    wt_git = self.git.at(wt)
                     self._apply(wt_git, artifact.patch)
                     self._check_policy(wt_git, req.expected_base_sha)
                     self._collect_stats(wt_git, req.expected_base_sha, outcome)
@@ -192,10 +321,8 @@ class Repository:
             outcome.ok = False
             if publish:
                 outcome.git_publish = "failed"
-            outcome.error = ErrorInfo(
-                code=exc.code, message=exc.message, http_status=exc.http_status, details=exc.details
-            )
-        log_event(
+            outcome.error = _error_info(exc)
+        self.events.emit(
             outcome.operation,
             repo=self.key,
             repository=req.repository,
@@ -211,7 +338,7 @@ class Repository:
             checks=[(c.name, c.exit_code) for c in outcome.validation.checks] if outcome.validation else None,
             duration_ms=int((time.monotonic() - started) * 1000),
         )
-        return outcome
+        return outcome.summarise()
 
     @contextmanager
     def _worktree(self, sha: str) -> Iterator[Path]:
@@ -221,7 +348,7 @@ class Repository:
         path = parent / "wt"
         try:
             self.git.run(["worktree", "add", "--quiet", "--detach", str(path), sha])
-            head = Git(path).text(["rev-parse", "HEAD"])
+            head = self.git.at(path).text(["rev-parse", "HEAD"])
             if head != sha:
                 raise GitError("temporary worktree is not at the expected commit")
             yield path
@@ -367,18 +494,59 @@ class Repository:
         try:
             self.fetch(branch)
         except BridgeError as exc:
-            log_event("post_push_fetch_failed", repo=self.key, branch=branch, error=exc.code)
+            self.events.emit("post_push_fetch_failed", repo=self.key, branch=branch, error=exc.code)
 
 
 class Bridge:
     """Registry of configured repositories. Unknown keys are rejected."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        events: EventLog | None = None,
+        store_factory: StoreFactory | None = None,
+    ) -> None:
         self.settings = settings
-        self._repositories = {key: Repository(key, cfg, settings) for key, cfg in settings.repositories.items()}
+        self.events = events or EventLog(settings.audit_log)
+        self._repositories = {
+            key: Repository(key, cfg, settings, events=self.events, store_factory=store_factory)
+            for key, cfg in settings.repositories.items()
+        }
+
+    @property
+    def keys(self) -> list[str]:
+        return list(self._repositories)
 
     def repository(self, key: str) -> Repository:
         try:
             return self._repositories[key]
         except KeyError:
-            raise NotAllowed("unknown repository") from None
+            raise UnknownRepository("unknown repository") from None
+
+
+def default_store_factory(settings: Settings) -> StoreFactory | None:
+    """Store factory for the configured snapshot transport."""
+    transport = settings.snapshot.transport
+    if transport == "none":
+        return None
+    if transport == "local":
+        from .store import LocalDirectorySnapshotStore
+
+        root = settings.snapshot.local_root
+
+        def local(repo: Repository) -> SnapshotStore:
+            return LocalDirectorySnapshotStore(root.joinpath(*repo.config.export.drive_root.split("/")))
+
+        return local
+
+    from .drive import GoogleDriveSnapshotStore, build_drive_api
+
+    token_file = settings.google.token_file
+
+    def google(repo: Repository) -> SnapshotStore:
+        return GoogleDriveSnapshotStore(
+            build_drive_api(token_file), repo_key=repo.key, drive_root=repo.config.export.drive_root
+        )
+
+    return google

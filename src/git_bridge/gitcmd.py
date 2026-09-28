@@ -98,9 +98,15 @@ class GitResult:
 class Git:
     """Runs git with ``cwd`` as the repository (bare clone or worktree)."""
 
-    def __init__(self, cwd: Path, *, timeout: int = 300) -> None:
+    def __init__(self, cwd: Path, *, timeout: int = 300, extra_config: Sequence[str] = ()) -> None:
         self.cwd = Path(cwd)
         self.timeout = timeout
+        # Validated against an allowlist in configuration.
+        self.extra_config = tuple(extra_config)
+
+    def at(self, cwd: Path) -> "Git":
+        """Same settings, different repository directory (e.g. a worktree)."""
+        return Git(cwd, timeout=self.timeout, extra_config=self.extra_config)
 
     def run(
         self,
@@ -114,7 +120,7 @@ class Git:
         if isinstance(args, (str, bytes)) or not all(isinstance(a, str) for a in args):
             raise TypeError("git arguments must be a sequence of str")
         argv = ["git"]
-        for item in _FIXED_CONFIG:
+        for item in (*_FIXED_CONFIG, *self.extra_config):
             argv += ["-c", item]
         argv += list(args)
 

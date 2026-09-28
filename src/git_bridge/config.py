@@ -3,9 +3,10 @@ request input is only ever matched against it."""
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -59,10 +60,22 @@ class ValidationCommand(_Strict):
 
 class ExportConfig(_Strict):
     drive_root: str
+    # Branch to export; defaults to the first allowed branch.
+    branch: str | None = None
     bootstrap: list[str] = Field(default_factory=list)
     lazy: list[str] = Field(default_factory=list)
     indexes: list[str] = Field(default_factory=list)
     exclude: list[str] = Field(default_factory=list)
+    max_file_bytes: Annotated[int, Field(gt=0)] = 10 * 1024 * 1024
+    max_total_bytes: Annotated[int, Field(gt=0)] = 200 * 1024 * 1024
+
+    @field_validator("drive_root")
+    @classmethod
+    def _check_root(cls, v: str) -> str:
+        parts = v.strip("/").split("/")
+        if not v.strip("/") or any(p in ("", ".", "..") for p in parts):
+            raise ValueError(f"invalid drive_root {v!r}")
+        return "/".join(parts)
 
 
 class RepositoryConfig(_Strict):
@@ -105,6 +118,19 @@ class RepositoryConfig(_Strict):
             raise ValueError("duplicate allowed_branches entry")
         return v
 
+    @model_validator(mode="after")
+    def _export_branch_allowed(self) -> "RepositoryConfig":
+        if self.export is not None and self.export.branch is not None:
+            if self.export.branch not in self.allowed_branches:
+                raise ValueError("export.branch must be one of allowed_branches")
+        return self
+
+    @property
+    def export_branch(self) -> str:
+        if self.export is not None and self.export.branch is not None:
+            return self.export.branch
+        return self.allowed_branches[0]
+
     @property
     def effective_remote_url(self) -> str:
         return self.remote_url or github_url(self.github_repo)
@@ -135,13 +161,81 @@ class Limits(_Strict):
     max_commit_message_bytes: Annotated[int, Field(gt=0)] = 16 * 1024
 
 
+def is_loopback_host(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class ServerConfig(_Strict):
+    # Loopback only. TLS and tailnet exposure are Tailscale Serve's job.
+    host: str = "127.0.0.1"
+    port: Annotated[int, Field(gt=0, lt=65536)] = 8000
+    bearer_token_file: Path | None = None
+
+    @field_validator("host")
+    @classmethod
+    def _loopback_only(cls, v: str) -> str:
+        if not is_loopback_host(v):
+            raise ValueError(
+                f"server.host {v!r} is not a loopback address; the bridge must only listen on "
+                "127.0.0.1/::1 and be exposed through Tailscale Serve"
+            )
+        return v
+
+
+class SnapshotConfig(_Strict):
+    transport: Literal["google_drive", "local", "none"] = "none"
+    # Target directory for the "local" transport (development / testing).
+    local_root: Path | None = None
+
+    @model_validator(mode="after")
+    def _local_needs_root(self) -> "SnapshotConfig":
+        if self.transport == "local" and self.local_root is None:
+            raise ValueError("snapshot.local_root is required for the local transport")
+        return self
+
+
+class GoogleConfig(_Strict):
+    client_secrets_file: Path
+    token_file: Path
+
+
+# Extra Git settings an operator may set (e.g. http.sslBackend=schannel on
+# Windows). Anything that could run programs or change history is excluded.
+ALLOWED_EXTRA_GIT_CONFIG = frozenset({"http.sslbackend", "http.sslcainfo", "http.proxy", "http.version"})
+
+
 class Settings(_Strict):
     work_dir: Path
     github_token_file: Path | None = None
     git_identity: GitIdentity = GitIdentity()
+    git_extra_config: list[str] = Field(default_factory=list)
     limits: Limits = Limits()
     git_timeout_seconds: Annotated[int, Field(gt=0, le=3600)] = 300
+    server: ServerConfig = ServerConfig()
+    snapshot: SnapshotConfig = SnapshotConfig()
+    google: GoogleConfig | None = None
+    audit_log: Path | None = None
     repositories: Annotated[dict[str, RepositoryConfig], Field(min_length=1)]
+
+    @field_validator("git_extra_config")
+    @classmethod
+    def _check_extra_config(cls, v: list[str]) -> list[str]:
+        for item in v:
+            key, sep, _ = item.partition("=")
+            if not sep or key.strip().lower() not in ALLOWED_EXTRA_GIT_CONFIG:
+                raise ValueError(f"git_extra_config entry {item!r} is not allowed")
+        return v
+
+    @model_validator(mode="after")
+    def _google_needs_credentials(self) -> "Settings":
+        if self.snapshot.transport == "google_drive" and self.google is None:
+            raise ValueError("snapshot.transport google_drive requires a google section")
+        return self
 
     @field_validator("repositories")
     @classmethod

@@ -86,3 +86,25 @@ class GitError(BridgeError):
         super().__init__(message, returncode=returncode, stderr=stderr)
         self.returncode = returncode
         self.stderr = stderr
+
+
+class UnknownRepository(BridgeError):
+    code = "unknown_repository"
+    http_status = 404
+
+
+class Unauthorized(BridgeError):
+    code = "unauthorized"
+    http_status = 401
+
+
+class SnapshotError(BridgeError):
+    """Building or exporting a snapshot failed. Never undoes a Git push."""
+
+    code = "snapshot_failed"
+    http_status = 502
+
+
+class SnapshotNotConfigured(BridgeError):
+    code = "snapshot_not_configured"
+    http_status = 409

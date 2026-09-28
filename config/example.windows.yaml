@@ -1,0 +1,53 @@
+# Example configuration for a Windows host (e.g. the PC running Tailscale).
+# Copy to %USERPROFILE%\.config\agent-git-bridge\config.yaml and adjust.
+# All secrets are separate files referenced by path; none belong in Git.
+
+work_dir: C:/Users/YOU/AppData/Local/agent-git-bridge/work
+audit_log: C:/Users/YOU/AppData/Local/agent-git-bridge/audit.jsonl
+github_token_file: C:/Users/YOU/.config/agent-git-bridge/github-token.txt
+
+# Use the Windows certificate store for HTTPS (the bridge ignores the
+# system/global Git config on purpose, so this must be stated here).
+git_extra_config:
+  - http.sslBackend=schannel
+
+git_identity:
+  name: Git Bridge
+  email: git-bridge@users.noreply.github.com
+
+server:
+  host: 127.0.0.1          # loopback only; Tailscale Serve provides HTTPS
+  port: 8000
+  bearer_token_file: C:/Users/YOU/.config/agent-git-bridge/bearer-token.txt
+
+snapshot:
+  transport: google_drive
+
+google:
+  client_secrets_file: C:/Users/YOU/.config/agent-git-bridge/google-client.json
+  token_file: C:/Users/YOU/.config/agent-git-bridge/google-token.json
+
+repositories:
+  rot3k:
+    github_repo: iascus/rt3k          # rename later: iascus/rot3k + former_github_repos: [iascus/rt3k]
+    local_path: C:/Users/YOU/AppData/Local/agent-git-bridge/repos/rot3k.git
+    allowed_branches: [design-docs]
+    denied_paths: [.github/**]
+    export:
+      drive_root: ChatGPT/rot3k
+      bootstrap: ["*.md", docs/**/*.md]
+      indexes: ["**/index*.json", "**/index*.md"]
+      lazy: ["**/*.md", "**/*.json", "**/*.yaml", "**/*.yml", "**/*.txt"]
+      exclude: [.github/**]
+
+  cyberpunk-tactics:
+    github_repo: iascus/cyberpunk-tactics
+    local_path: C:/Users/YOU/AppData/Local/agent-git-bridge/repos/cyberpunk-tactics.git
+    allowed_branches: [design-docs]
+    denied_paths: [.github/**]
+    export:
+      drive_root: ChatGPT/cyberpunk-tactics
+      bootstrap: ["*.md", docs/**/*.md]
+      indexes: ["**/index*.json", "**/index*.md"]
+      lazy: ["**/*.md", "**/*.json", "**/*.yaml", "**/*.yml", "**/*.txt"]
+      exclude: [.github/**]

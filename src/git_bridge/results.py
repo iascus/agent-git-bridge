@@ -48,7 +48,33 @@ class PublishOutcome(BaseModel):
     deletions: int = 0
     validation: ValidationReport | None = None
     git_publish: Literal["success", "failed", "skipped"] = "skipped"
+    # Drive refresh after a successful publication. A failure here never
+    # changes git_publish; retry with POST /repos/{repo}/refresh.
+    snapshot_refresh: Literal["success", "failed", "skipped", "not_configured"] = "skipped"
+    snapshot_commit: str | None = None
+    snapshot_error: str | None = None
     error: ErrorInfo | None = None
+    # One human-readable line, e.g. for display in an iOS Shortcut.
+    message: str = ""
+
+    def summarise(self) -> "PublishOutcome":
+        if self.error is not None:
+            self.message = f"Rejected ({self.error.code}): {self.error.message}"
+        elif self.operation == "validate":
+            self.message = (
+                f"Patch OK for {self.repository}@{self.branch}: {self.files_changed} file(s), "
+                f"+{self.insertions} -{self.deletions}. Nothing was committed."
+            )
+        else:
+            self.message = (
+                f"Published {(self.new_sha or '')[:12]} to {self.repository}@{self.branch}: "
+                f"{self.files_changed} file(s), +{self.insertions} -{self.deletions}."
+            )
+            if self.snapshot_refresh == "failed":
+                self.message += " Drive snapshot refresh FAILED; run Refresh Git Snapshot."
+            elif self.snapshot_refresh == "success":
+                self.message += " Drive snapshot updated."
+        return self
 
 
 class BranchStatus(BaseModel):
@@ -57,7 +83,48 @@ class BranchStatus(BaseModel):
     error: str | None = None
 
 
+class SnapshotInfo(BaseModel):
+    state: str | None = None
+    commit: str | None = None
+    generation_id: str | None = None
+    generated_at: str | None = None
+    file_count: int | None = None
+    error: str | None = None
+
+
 class RepositoryStatus(BaseModel):
     repository: str
     key: str
     branches: list[BranchStatus]
+    export_branch: str | None = None
+    snapshot: SnapshotInfo | None = None
+
+
+class RefreshOutcome(BaseModel):
+    ok: bool = False
+    operation: Literal["refresh"] = "refresh"
+    repository: str
+    key: str
+    branch: str | None = None
+    commit: str | None = None
+    previous_commit: str | None = None
+    generation_id: str | None = None
+    file_count: int = 0
+    exported: int = 0
+    uploaded: int = 0
+    unchanged: int = 0
+    deleted: int = 0
+    not_exported: int = 0
+    error: ErrorInfo | None = None
+    message: str = ""
+
+    def summarise(self) -> "RefreshOutcome":
+        if self.error is not None:
+            self.message = f"Snapshot refresh failed ({self.error.code}): {self.error.message}"
+        else:
+            self.message = (
+                f"Snapshot of {self.repository}@{self.branch} at {(self.commit or '')[:12]}: "
+                f"{self.exported} file(s) exported ({self.uploaded} updated, {self.unchanged} unchanged, "
+                f"{self.deleted} removed)."
+            )
+        return self
