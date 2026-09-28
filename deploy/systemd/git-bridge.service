@@ -1,0 +1,52 @@
+# agent-git-bridge as a hardened systemd service (Linux).
+# Listens on 127.0.0.1:8000 only; Tailscale Serve provides private HTTPS.
+#
+# Install: see docs/DEPLOYMENT.md
+#   sudo cp deploy/systemd/git-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now git-bridge
+
+[Unit]
+Description=agent-git-bridge (loopback HTTP, exposed via Tailscale Serve)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=git-bridge
+Group=git-bridge
+Environment=GIT_BRIDGE_CONFIG=/etc/git-bridge/config.yaml
+Environment=HOME=/var/lib/git-bridge
+ExecStart=/opt/agent-git-bridge/.venv/bin/git-bridge serve
+Restart=on-failure
+RestartSec=5
+
+# State and secrets
+StateDirectory=git-bridge
+StateDirectoryMode=0700
+ReadOnlyPaths=/etc/git-bridge
+UMask=0077
+
+# Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -55,6 +55,7 @@ def serve(settings: Settings) -> int:
         proxy_headers=False,
         server_header=False,
         log_level="info",
+        log_config=None,  # use our logging setup (console and/or --log-file)
     )
     return 0
 
@@ -108,9 +109,24 @@ def check(settings: Settings) -> int:
     return 0 if ok else 1
 
 
+def _setup_logging(log_file: Path | None) -> None:
+    from logging.handlers import RotatingFileHandler
+
+    handlers: list[logging.Handler] = []
+    if sys.stderr is not None:  # None under pythonw (background service)
+        handlers.append(logging.StreamHandler())
+    if log_file is not None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"))
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", handlers=handlers or None
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="git-bridge", description="Guarded Git publication and snapshot export.")
     parser.add_argument("--config", help=f"configuration file (default {DEFAULT_CONFIG})")
+    parser.add_argument("--log-file", type=Path, help="also write logs to this file (rotated at 5 MB)")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("serve", help="run the HTTP service on the configured loopback address")
     sub.add_parser("check", help="verify configuration, credentials and remotes")
@@ -125,7 +141,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("zip", type=Path)
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    _setup_logging(args.log_file)
     try:
         settings = load_settings(_config_path(args.config))
         if args.command == "serve":
