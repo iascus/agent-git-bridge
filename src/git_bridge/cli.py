@@ -153,7 +153,14 @@ def main(argv: list[str] | None = None) -> int:
                 raise ConfigError("configuration has no google section")
             from .drive import google_login
 
-            google_login(settings.google.client_secrets_file, settings.google.token_file)
+            try:
+                google_login(settings.google.client_secrets_file, settings.google.token_file)
+            except Exception as exc:  # oauthlib errors, e.g. access_denied on the consent screen
+                raise ConfigError(
+                    f"Google login failed ({type(exc).__name__}: {str(exc).strip() or 'no details'}). "
+                    "On the consent screen choose Advanced > Go to Git Bridge, tick the Drive "
+                    "permission, and check the app is 'In production' (or you are a test user)."
+                ) from exc
             print(f"Google login stored in {settings.google.token_file}")
             return 0
         if args.command == "init-token":
