@@ -109,6 +109,17 @@ def check(settings: Settings) -> int:
     return 0 if ok else 1
 
 
+def _use_os_trust_store() -> None:
+    """Verify HTTPS (Google APIs, OAuth) against the operating system's
+    certificate store rather than a bundled CA list, matching what Git does
+    with http.sslBackend=schannel on Windows."""
+    try:
+        import truststore
+    except ImportError:
+        return
+    truststore.inject_into_ssl()
+
+
 def _setup_logging(log_file: Path | None) -> None:
     from logging.handlers import RotatingFileHandler
 
@@ -142,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     _setup_logging(args.log_file)
+    _use_os_trust_store()
     try:
         settings = load_settings(_config_path(args.config))
         if args.command == "serve":
@@ -155,12 +167,14 @@ def main(argv: list[str] | None = None) -> int:
 
             try:
                 google_login(settings.google.client_secrets_file, settings.google.token_file)
-            except Exception as exc:  # oauthlib errors, e.g. access_denied on the consent screen
-                raise ConfigError(
-                    f"Google login failed ({type(exc).__name__}: {str(exc).strip() or 'no details'}). "
-                    "On the consent screen choose Advanced > Go to Git Bridge, tick the Drive "
-                    "permission, and check the app is 'In production' (or you are a test user)."
-                ) from exc
+            except Exception as exc:
+                message = f"Google login failed ({type(exc).__name__}: {str(exc).strip()[:300] or 'no details'})."
+                if "access_denied" in str(exc) or type(exc).__name__ == "AccessDeniedError":
+                    message += (
+                        " On the consent screen choose Advanced > Go to Git Bridge, tick the Drive "
+                        "permission, and check the app is 'In production' (or you are a test user)."
+                    )
+                raise ConfigError(message) from exc
             print(f"Google login stored in {settings.google.token_file}")
             return 0
         if args.command == "init-token":
