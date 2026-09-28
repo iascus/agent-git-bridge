@@ -117,7 +117,7 @@ Tailnet client (iPhone)
    │
    │ HTTPS (TLS terminated by Tailscale Serve)
    ▼
-Tailscale Serve  https://git-bridge.<tailnet>.ts.net
+Tailscale Serve  https://<machine>.<tailnet>.ts.net:10000
    │
    ▼
 127.0.0.1:8000   (Uvicorn, plain HTTP, loopback only)
@@ -133,12 +133,31 @@ FastAPI never handles TLS. The listener is bound to `127.0.0.1`; binding to
 | `git_bridge.config` | Load and strictly validate YAML configuration (repositories, allowed branches, validation commands, export rules, limits). |
 | `git_bridge.gitcmd` | The only place that executes Git. Fixed argument arrays, no shell, isolated from user/system Git config, timeouts, credentials injected via environment for network operations only. |
 | `git_bridge.artifact` | Parse and validate `publish.zip` in memory (size/entry limits, exact member names, checksum, strict `request.json` schema). Never extracts to disk. |
-| `git_bridge.repository` | Per-repository operations: ensure clone, fetch, status, isolated worktrees, validate/publish pipeline. |
-| `git_bridge.results` | Compact, structured result model returned by every operation. |
-| `git_bridge.errors` | Typed rejections with stable codes and suggested HTTP status. |
-| *(Phase 2)* `git_bridge.api` | FastAPI app, bearer-token auth. |
-| *(Phase 3)* `git_bridge.snapshot` | Commit inventory, classification, `snapshot.json` schema. |
-| *(Phase 4)* `git_bridge.drive` | `SnapshotStore` abstraction and `GoogleDriveSnapshotStore`. |
+| `git_bridge.repository` | Per-repository operations: ensure clone, fetch, status, isolated worktrees, validate/publish pipeline, refresh, publish-then-refresh. `Bridge` is the registry of configured repositories. |
+| `git_bridge.snapshot` | Commit inventory (`ls-tree`, `cat-file --batch`), bootstrap/index/lazy classification, `snapshot.json` schema, two-phase export protocol. |
+| `git_bridge.store` | `SnapshotStore` interface and `LocalDirectorySnapshotStore` (development, tests). |
+| `git_bridge.drive` | `GoogleDriveSnapshotStore`, thin Drive v3 wrapper, OAuth login and token refresh. |
+| `git_bridge.api` | FastAPI app: health, status, refresh, validate-patch, publish. |
+| `git_bridge.auth` | `Authenticator` seam; bearer-token implementation. |
+| `git_bridge.events` | Structured log events and the append-only audit log. |
+| `git_bridge.cli` | `git-bridge` command: serve, check, init-token, google-login, status, refresh, validate, publish. |
+| `git_bridge.results` | Compact, structured result models returned by every operation. |
+| `git_bridge.errors` | Typed rejections with stable codes and HTTP status. |
+
+## HTTP API
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| GET | `/health` | none | `{"status":"ok"}`; nothing else |
+| GET | `/repos/{repo}/status` | bearer | Remote head of each allowed branch, current snapshot state |
+| POST | `/repos/{repo}/refresh` | bearer | Fetch and export the export branch head |
+| POST | `/repos/{repo}/validate-patch` | bearer | Full publication checks, no commit |
+| POST | `/repos/{repo}/publish` | bearer | Guarded commit + push, then snapshot refresh |
+
+Upload bodies are the ZIP itself (`application/zip` or octet-stream) or a
+`multipart/form-data` body with exactly one file; no base64/JSON wrapping.
+Bodies are streamed with the size limit enforced before parsing. Response
+formats and status codes: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Git core
 
@@ -233,7 +252,7 @@ as the service user. Prefer validators that only *inspect* files (linters,
 schema checkers), or run the service under a dedicated account with systemd
 sandboxing. See `SECURITY.md`.
 
-## Snapshot export (Phases 3–4)
+## Snapshot export
 
 ### Consistency model
 
@@ -260,11 +279,27 @@ a retry of `refresh` completes it.
 
 - Scope `https://www.googleapis.com/auth/drive.file`: the bridge can only see
   files it created.
-- Repository-relative paths are mirrored as Drive folders under
-  `export.drive_root`. The path → Drive file ID mapping is kept in local state
-  and also recorded in `snapshot.json`, so readers and the bridge agree.
-- Text files first; binary files are listed in `snapshot.json` but not
-  exported in the MVP.
+- Repository-relative paths are mirrored as real Drive folders under
+  `export.drive_root`, so ChatGPT's Drive integration shows the familiar tree.
+- Each bridge-created file carries private `appProperties`: repository key,
+  kind (`file`/`folder`/`snapshot`), Git blob SHA, class, and its repository
+  path (split into ≤100-byte chunks because a property is limited to 124
+  bytes). The Drive state is therefore **self-describing**: there is no local
+  index that could drift, a fresh process rediscovers everything with one
+  query, and duplicates left by an interrupted run are trashed.
+- Files are updated in place (same file ID, name and folder). Removed files go
+  to the Drive trash. `snapshot.json` records each file's `drive_file_id`.
+- Text files only; binary, symlinked, oversized files are listed in
+  `snapshot.json` with `exported: false` and a `reason`.
+
+### Snapshot after publication
+
+`publish` exports the **newly published commit** (which must be reachable
+from the fetched branch head) after the push. A snapshot failure is reported
+as `snapshot_refresh: "failed"` with `snapshot_error`, while
+`git_publish: "success"` and HTTP 200 still stand; `refresh` can be retried
+independently. Exports hold a separate per-repository lock so a slow Drive
+upload does not block Git operations longer than necessary.
 
 ## Authentication
 
@@ -329,13 +364,35 @@ correctness, security or simplicity.
   by another writer, so it is accepted.
 - Validation commands are not sandboxed by the application (see above).
 - One Uvicorn worker only; locks are in-process.
+- A worktree left behind by a killed process is removed at the start of the
+  next publication for that repository (worktree folders are named
+  `<key>.<random>`; keys cannot contain `.`, so repositories never touch each
+  other's folders).
+- The first export of a large repository can take minutes (one Drive API
+  call per file); later exports only upload changed blobs.
+
+## Deployment
+
+Reference deployment: the Windows PC `cave` (Tailscale machine name), running
+the bridge as a hidden per-user scheduled task and exposing it with
+`tailscale serve --bg --https=10000 http://127.0.0.1:8000` next to an
+unrelated existing Serve entry on port 443. A hardened systemd unit is
+provided for Linux. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) and
+[docs/TAILSCALE_SETUP.md](docs/TAILSCALE_SETUP.md).
 
 ## Implementation phases
 
+All six phases are implemented:
+
 1. **Git core** — config, fetch/status, isolated worktree, validate, commit,
-   guarded push, tests. *(done)*
-2. HTTP service — FastAPI, bearer auth, loopback binding.
-3. Snapshot generation.
-4. Google Drive transport.
-5. Tailscale Serve deployment.
-6. iOS Shortcuts.
+   guarded push.
+2. **HTTP service** — FastAPI, bearer auth, loopback-only binding.
+3. **Snapshot generation** — exact-commit inventory, blob SHAs,
+   classification, two-phase manifest.
+4. **Google Drive transport** — OAuth (`drive.file`), mirrored folders,
+   in-place updates, refresh after publication.
+5. **Tailscale deployment** — Serve on a dedicated HTTPS port, exposure
+   verified (see `docs/TAILSCALE_SETUP.md`).
+6. **iOS integration** — Share Sheet and refresh Shortcuts
+   (`docs/IOS_SHORTCUTS.md`); the on-device end-to-end run is performed by the
+   user.
