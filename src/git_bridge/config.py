@@ -62,6 +62,10 @@ class ExportConfig(_Strict):
     drive_root: str
     # Branch to export; defaults to the first allowed branch.
     branch: str | None = None
+    # Repository path of a source manifest whose project_source_files block
+    # defines the exported file set (and whose optional materialization block
+    # defines bootstrap/lazy). Mutually exclusive with bootstrap/lazy/indexes.
+    manifest: str | None = None
     bootstrap: list[str] = Field(default_factory=list)
     lazy: list[str] = Field(default_factory=list)
     indexes: list[str] = Field(default_factory=list)
@@ -76,6 +80,16 @@ class ExportConfig(_Strict):
         if not v.strip("/") or any(p in ("", ".", "..") for p in parts):
             raise ValueError(f"invalid drive_root {v!r}")
         return "/".join(parts)
+
+    @model_validator(mode="after")
+    def _one_selection_method(self) -> "ExportConfig":
+        if self.manifest is not None:
+            if self.bootstrap or self.lazy or self.indexes:
+                raise ValueError("export.manifest cannot be combined with bootstrap/lazy/indexes rules")
+            parts = self.manifest.split("/")
+            if self.manifest.startswith("/") or any(p in ("", ".", "..") for p in parts):
+                raise ValueError(f"invalid export.manifest path {self.manifest!r}")
+        return self
 
 
 class RepositoryConfig(_Strict):

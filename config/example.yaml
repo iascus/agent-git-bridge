@@ -60,6 +60,10 @@ repositories:
 
     export:
       drive_root: ChatGPT/rot3k
+      # Either: let the repository's manifest define the exported set, e.g.
+      #   manifest: docs/design/MANIFEST.md
+      # (reads its PROJECT_SOURCE_FILES / PROJECT_SOURCE_MATERIALIZATION
+      # blocks at the exported commit), or: glob rules as below.
       bootstrap:
         - MANIFEST.md
         - PROJECT_WORKFLOW.md

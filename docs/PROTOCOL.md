@@ -65,6 +65,21 @@ Complete snapshot:
 
 Files matched by `exclude`, or by no rule at all, are not listed.
 
+### Selection by the repository's manifest
+
+With `export.manifest: docs/design/MANIFEST.md` the bridge reads that file
+**at the exported commit** and exports exactly the paths in its
+`project_source_files` block (between `<!-- PROJECT_SOURCE_FILES_BEGIN -->`
+and `<!-- PROJECT_SOURCE_FILES_END -->`), minus configured `exclude`s. An
+optional `project_source_materialization` block
+(`<!-- PROJECT_SOURCE_MATERIALIZATION_BEGIN/END -->`) sets `default`
+(`bootstrap`) and named lazy classes with `globs`/`paths`; a lazy file's
+entry carries `"lazy_class": "<name>"`. A listed path absent from the commit
+appears with `exported: false, reason: "missing"`. A malformed manifest, a
+duplicate or unsafe path, or a path matching two lazy classes fails the
+refresh. `snapshot.json` then includes
+`"selection": {"source": "manifest", "manifest": "…", "manifest_blob_sha": "…"}`.
+
 While an export runs, `snapshot.json` is replaced by a marker:
 
 ```json

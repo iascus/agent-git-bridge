@@ -17,6 +17,7 @@ from typing import Any
 
 from . import pathglob
 from .config import ExportConfig
+from .manifest import parse_manifest
 from .errors import SnapshotError
 from .events import utc_now
 from .gitcmd import Git
@@ -140,21 +141,48 @@ def build_snapshot(
     export: ExportConfig,
 ) -> SnapshotBuild:
     tree = git.text(["rev-parse", "--verify", "--end-of-options", f"{commit}^{{tree}}"])
-    selected: list[tuple[TreeEntry, str]] = []
-    for entry in list_tree(git, commit):
-        file_class = classify(entry.path, export)
-        if file_class is not None:
-            selected.append((entry, file_class))
+    entries = list_tree(git, commit)
+    selection_info: dict[str, Any]
+    # (entry, class, lazy class name)
+    selected: list[tuple[TreeEntry, str, str | None]] = []
+    missing: list[tuple[str, str, str | None]] = []
+    if export.manifest is not None:
+        by_path = {e.path: e for e in entries}
+        manifest_entry = by_path.get(export.manifest)
+        if manifest_entry is None:
+            raise SnapshotError(f"manifest {export.manifest} does not exist at commit {commit[:12]}")
+        selection = parse_manifest(read_blobs(git, [manifest_entry.blob_sha])[manifest_entry.blob_sha], export.manifest)
+        for path in selection.files:
+            if pathglob.match_any(path, export.exclude):
+                continue
+            file_class, lazy_class = selection.classify(path)
+            if path in by_path:
+                selected.append((by_path[path], file_class, lazy_class))
+            else:
+                missing.append((path, file_class, lazy_class))
+        selection_info = {"source": "manifest", "manifest": export.manifest, "manifest_blob_sha": manifest_entry.blob_sha}
+    else:
+        for entry in entries:
+            file_class = classify(entry.path, export)
+            if file_class is not None:
+                selected.append((entry, file_class, None))
+        selection_info = {"source": "rules"}
 
     files: dict[str, dict[str, Any]] = {}
+    for path, file_class, lazy_class in missing:
+        files[path] = {"blob_sha": None, "size": 0, "class": file_class, "exported": False, "reason": "missing"}
+        if lazy_class:
+            files[path]["lazy_class"] = lazy_class
     to_read: list[TreeEntry] = []
-    for entry, file_class in selected:
+    for entry, file_class, lazy_class in selected:
         info: dict[str, Any] = {
             "blob_sha": entry.blob_sha,
             "size": entry.size,
             "class": file_class,
             "exported": False,
         }
+        if lazy_class:
+            info["lazy_class"] = lazy_class
         files[entry.path] = info
         try:
             check_relative_path(entry.path)
@@ -197,6 +225,7 @@ def build_snapshot(
         "generated_at": None,  # set at publication time
         "previous_commit": None,
         "drive_root": export.drive_root,
+        "selection": selection_info,
         "snapshot_file": SNAPSHOT_NAME,
         "reader_notes": READER_NOTES,
         "counts": {
@@ -205,6 +234,7 @@ def build_snapshot(
             "bootstrap": sum(1 for f in files.values() if f["class"] == "bootstrap" and f["exported"]),
             "index": sum(1 for f in files.values() if f["class"] == "index" and f["exported"]),
             "lazy": sum(1 for f in files.values() if f["class"] == "lazy" and f["exported"]),
+            "missing": len(missing),
         },
         "files": dict(sorted(files.items())),
     }

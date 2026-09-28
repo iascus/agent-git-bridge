@@ -35,10 +35,7 @@ repositories:
     denied_paths: [.github/**]
     export:
       drive_root: ChatGPT/rot3k
-      bootstrap: ["*.md", docs/**/*.md]
-      indexes: ["**/index*.json", "**/index*.md"]
-      lazy: ["**/*.md", "**/*.json", "**/*.yaml", "**/*.yml", "**/*.txt"]
-      exclude: [.github/**]
+      manifest: docs/design/MANIFEST.md   # the repo's own source inventory
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
@@ -47,7 +44,4 @@ repositories:
     denied_paths: [.github/**]
     export:
       drive_root: ChatGPT/cyberpunk-tactics
-      bootstrap: ["*.md", docs/**/*.md]
-      indexes: ["**/index*.json", "**/index*.md"]
-      lazy: ["**/*.md", "**/*.json", "**/*.yaml", "**/*.yml", "**/*.txt"]
-      exclude: [.github/**]
+      manifest: docs/design/MANIFEST.md   # the repo's own source inventory

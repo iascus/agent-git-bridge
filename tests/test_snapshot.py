@@ -150,7 +150,7 @@ def test_snapshot_lists_exact_commit_with_correct_blob_shas(snapenv: GitEnv):
             assert hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest() == info["blob_sha"]
     assert m["files"]["assets/image.bin"] == {**m["files"]["assets/image.bin"], "exported": False, "reason": "binary"}
     assert m["files"]["characters/index.json"]["class"] == "index"
-    assert m["counts"] == {"listed": 7, "exported": 6, "bootstrap": 3, "index": 1, "lazy": 2}
+    assert m["counts"] == {"listed": 7, "exported": 6, "bootstrap": 3, "index": 1, "lazy": 2, "missing": 0}
 
 
 def test_oversized_and_symlinked_files_listed_but_not_exported(snapenv: GitEnv):
@@ -338,3 +338,124 @@ def test_status_reports_snapshot(snapenv: GitEnv):
     assert status.snapshot.state == "complete"
     assert status.snapshot.commit == snapenv.head()
     assert status.snapshot.file_count == 6
+
+
+# ------------------------------------------------------ manifest selection
+
+from git_bridge.manifest import parse_manifest  # noqa: E402
+
+MANIFEST_MD = """# Source Manifest
+
+Prose that mentions docs/rules.md is ignored.
+
+<!-- PROJECT_SOURCE_MATERIALIZATION_BEGIN -->
+```yaml
+project_source_materialization:
+  default: bootstrap
+  lazy:
+    dossiers:
+      globs:
+        - characters/*.md
+    records:
+      paths:
+        - records/juan-23.md
+```
+<!-- PROJECT_SOURCE_MATERIALIZATION_END -->
+
+<!-- PROJECT_SOURCE_FILES_BEGIN -->
+```yaml
+project_source_files:
+  - docs/design/MANIFEST.md
+  - MANIFEST.md
+  - characters/alice.md
+  - records/juan-23.md
+  - records/private-notes.md
+  - docs/gone.md
+```
+<!-- PROJECT_SOURCE_FILES_END -->
+"""
+
+
+def _commit(env: GitEnv, edits: dict) -> str:
+    env._reset_seed()
+    env._write(edits)
+    git(env.seed, "add", "-A")
+    git(env.seed, "commit", "--quiet", "-m", "manifest change")
+    git(env.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
+    return env.head()
+
+
+@pytest.fixture
+def manifestenv(snapenv: GitEnv) -> GitEnv:
+    snapenv.with_repo_config(
+        export=ExportConfig(drive_root="ChatGPT/rot3k", manifest="docs/design/MANIFEST.md", exclude=["records/private-*"])
+    )
+    _commit(snapenv, {"docs/design/MANIFEST.md": MANIFEST_MD})
+    return snapenv
+
+
+def test_manifest_defines_exactly_the_exported_set(manifestenv: GitEnv):
+    out = manifestenv.repo.refresh()
+    assert out.ok, out.error
+    m = _manifest(manifestenv)
+    assert set(_exported(manifestenv)) == {"docs/design/MANIFEST.md", "MANIFEST.md", "characters/alice.md", "records/juan-23.md"}
+    files = m["files"]
+    assert files["docs/gone.md"] == {"blob_sha": None, "size": 0, "class": "bootstrap", "exported": False, "reason": "missing"}
+    assert "records/private-notes.md" not in files  # excluded by configuration
+    assert "docs/rules.md" not in files and "src/unmatched.py" not in files  # not in the manifest
+    assert (files["characters/alice.md"]["class"], files["characters/alice.md"]["lazy_class"]) == ("lazy", "dossiers")
+    assert files["records/juan-23.md"]["lazy_class"] == "records"
+    assert files["MANIFEST.md"]["class"] == "bootstrap" and "lazy_class" not in files["MANIFEST.md"]
+    assert m["selection"]["source"] == "manifest"
+    assert m["selection"]["manifest_blob_sha"] == git(manifestenv.origin, "rev-parse", f"{out.commit}:docs/design/MANIFEST.md")
+    assert m["counts"]["missing"] == 1
+
+
+def test_manifest_change_updates_selection_and_removes_dropped_files(manifestenv: GitEnv):
+    assert manifestenv.repo.refresh().ok
+    _commit(manifestenv, {"docs/design/MANIFEST.md": MANIFEST_MD.replace("  - characters/alice.md\n", "  - docs/rules.md\n")})
+    out = manifestenv.repo.refresh()
+    assert out.ok and out.deleted == 1
+    exported = _exported(manifestenv)
+    assert "characters/alice.md" not in exported and exported["docs/rules.md"] == b"Rules\n"
+
+
+def test_manifest_without_materialization_is_all_bootstrap():
+    sel = parse_manifest(b"<!-- PROJECT_SOURCE_FILES_BEGIN -->\nproject_source_files: [a.md, b/c.md]\n<!-- PROJECT_SOURCE_FILES_END -->", "M.md")
+    assert sel.files == ["a.md", "b/c.md"]
+    assert sel.classify("b/c.md") == ("bootstrap", None)
+
+
+@pytest.mark.parametrize(
+    "manifest,problem",
+    [
+        ("# no blocks here\n", "no PROJECT_SOURCE_FILES block"),
+        ("<!-- PROJECT_SOURCE_FILES_BEGIN -->\nproject_source_files: [a.md, a.md]\n<!-- PROJECT_SOURCE_FILES_END -->", "listed twice"),
+        ("<!-- PROJECT_SOURCE_FILES_BEGIN -->\nproject_source_files: [../etc/passwd]\n<!-- PROJECT_SOURCE_FILES_END -->", "unsafe path"),
+        ("<!-- PROJECT_SOURCE_FILES_BEGIN -->\nproject_source_files: [[}\n<!-- PROJECT_SOURCE_FILES_END -->", "not valid YAML"),
+        ("<!-- PROJECT_SOURCE_FILES_BEGIN -->\nproject_source_files: []\n<!-- PROJECT_SOURCE_FILES_END -->", "empty"),
+    ],
+)
+def test_malformed_manifest_rejected(manifest, problem):
+    with pytest.raises(SnapshotError, match=problem):
+        parse_manifest(manifest.encode(), "M.md")
+
+
+def test_path_in_two_lazy_classes_fails_the_refresh(manifestenv: GitEnv):
+    overlapping = MANIFEST_MD.replace("        - records/juan-23.md\n", "        - characters/alice.md\n")
+    _commit(manifestenv, {"docs/design/MANIFEST.md": overlapping})
+    out = manifestenv.repo.refresh()
+    assert not out.ok and "several lazy classes" in out.error.message
+
+
+def test_missing_manifest_file_fails_the_refresh(snapenv: GitEnv):
+    snapenv.with_repo_config(export=ExportConfig(drive_root="x", manifest="docs/design/MANIFEST.md"))
+    out = snapenv.repo.refresh()
+    assert not out.ok and "does not exist" in out.error.message
+
+
+def test_manifest_and_rules_are_mutually_exclusive():
+    with pytest.raises(ValueError):
+        ExportConfig(drive_root="x", manifest="M.md", bootstrap=["*.md"])
+    with pytest.raises(ValueError):
+        ExportConfig(drive_root="x", manifest="../M.md")
