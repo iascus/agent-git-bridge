@@ -1,0 +1,52 @@
+# Example configuration. Copy to config/local.yaml (git-ignored) and edit.
+# Only repositories and branches listed here can ever be touched.
+
+work_dir: /srv/git-bridge/work          # temporary publication worktrees
+github_token_file: /etc/git-bridge/github-token   # optional; outside the repo, mode 0600
+
+git_identity:
+  name: Git Bridge
+  email: git-bridge@users.noreply.github.com
+
+limits:
+  max_archive_bytes: 5242880            # 5 MiB compressed upload
+  max_uncompressed_bytes: 20971520      # 20 MiB total after decompression
+  max_member_bytes: 16777216            # 16 MiB per archive member
+  max_entries: 8
+
+repositories:
+  rot3k:
+    github_repo: iascus/rot3k
+    local_path: /srv/git-bridge/repos/rot3k   # persistent bare clone
+    remote: origin
+    # remote_url defaults to https://github.com/<github_repo>.git
+
+    allowed_branches:
+      - design-docs
+
+    # Staged paths matching these globs are rejected.
+    denied_paths:
+      - .github/**
+
+    # Always run first (built in): git diff --cached --check
+    # Additional commands run in the temporary worktree, no shell, minimal env.
+    validation: []
+    #  - name: markdown-lint
+    #    command: ["markdownlint-cli2", "**/*.md"]
+    #    timeout_seconds: 120
+
+    export:
+      drive_root: ChatGPT/rot3k
+      bootstrap:
+        - MANIFEST.md
+        - PROJECT_WORKFLOW.md
+        - AGENTS.md
+        - docs/**/*.md
+      lazy:
+        - characters/**/*.md
+        - records/**/*.md
+        - romance/**/*.md
+      indexes:
+        - characters/index*.json
+        - characters/index*.md
+      exclude: []

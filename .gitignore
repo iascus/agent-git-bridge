@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/
+
+# Local configuration and secrets — never commit these
+config/local.yaml
+config/*.local.yaml
+secrets/
+*.token
+credentials*.json
+token*.json
+
+# Runtime state
+var/
