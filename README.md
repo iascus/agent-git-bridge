@@ -35,7 +35,9 @@ Google or Tailscale access.
 ## Configuration
 
 Copy [config/example.yaml](config/example.yaml) to `config/local.yaml`
-(git-ignored). Secrets (GitHub token, bearer token, Google credentials) live in
+(git-ignored). Any number of repositories can be configured side by side (the
+example has `rot3k` and `cyberpunk-tactics`); each gets its own clone, lock and
+Drive folder, and GitHub renames are handled with `former_github_repos`. Secrets (GitHub token, bearer token, Google credentials) live in
 files outside the repository and are referenced by path.
 
 ## License

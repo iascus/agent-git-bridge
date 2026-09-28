@@ -157,6 +157,30 @@ Each configured repository has one persistent **bare** clone at
 GitHub is authoritative for history. The local clone is disposable
 infrastructure: deleting it and re-cloning must always be safe.
 
+### Multiple repositories
+
+Several repositories (e.g. `rot3k` and `cyberpunk-tactics`) are configured
+side by side under stable keys; the key is what appears in URLs
+(`/repos/<key>/…`), Shortcuts and logs. Each repository has its **own** bare
+clone, its own lock and its own Drive export folder, so:
+
+- operations on different repositories run concurrently and never block each
+  other;
+- operations on the same repository are serialised (a second publication
+  against the same base gets `409 remote_changed` rather than racing);
+- temporary worktrees share `work_dir` but use unique per-repository names.
+
+Configuration loading rejects setups where repositories are not independent:
+the same GitHub repository (or former name) under two keys, overlapping or
+nested `local_path`s, a clone inside `work_dir`, or overlapping
+`export.drive_root`s. An artifact naming one repository is rejected by every
+other repository's endpoint.
+
+**Renames.** `github_repo` can change without changing the key. Listing the old
+name in `former_github_repos` keeps accepting artifacts that still name it and
+lets the bridge re-point an existing clone whose remote is exactly the old
+GitHub URL. Any other remote URL mismatch is refused.
+
 ### Git invocation rules
 
 - `subprocess.run([...], shell=False)` with argument lists built by server code.

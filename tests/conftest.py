@@ -64,19 +64,26 @@ def request_for(patch: bytes, base: str, **overrides) -> dict:
     return req
 
 
-def artifact_zip(patch: bytes, base: str, **overrides) -> bytes:
+def artifact_zip(patch: bytes, base: str, **overrides) -> bytes:  
     req = request_for(patch, base, **overrides)
     return make_zip({"request.json": json.dumps(req).encode(), "changes.patch": patch})
 
 
 @dataclass
 class GitEnv:
+    """One simulated GitHub remote (bare repo) plus a seed clone for other writers."""
+
     tmp: Path
     origin: Path
     seed: Path
     repo_config: RepositoryConfig
     settings: Settings
+    key: str = "rot3k"
     limits: Limits = field(default_factory=Limits)
+
+    @property
+    def github_repo(self) -> str:
+        return self.repo_config.github_repo
 
     @property
     def bridge(self) -> Bridge:
@@ -84,12 +91,13 @@ class GitEnv:
 
     @property
     def repo(self) -> Repository:
-        return self.bridge.repository("rot3k")
+        return self.bridge.repository(self.key)
 
     def with_repo_config(self, **changes) -> "GitEnv":
         cfg = self.repo_config.model_copy(update=changes)
         self.repo_config = cfg
-        self.settings = self.settings.model_copy(update={"repositories": {"rot3k": cfg}})
+        repositories = {**self.settings.repositories, self.key: cfg}
+        self.settings = self.settings.model_copy(update={"repositories": repositories})
         return self
 
     def head(self, branch: str = BRANCH) -> str:
@@ -131,15 +139,17 @@ class GitEnv:
         return self.head()
 
     def artifact(self, patch: bytes, base: str, **overrides) -> PublishArtifact:
+        overrides.setdefault("repository", self.github_repo)
         return parse_artifact(artifact_zip(patch, base, **overrides), self.limits)
 
 
-@pytest.fixture
-def gitenv(tmp_path: Path) -> GitEnv:
-    origin = tmp_path / "origin.git"
-    git(tmp_path, "init", "--quiet", "--bare", str(origin))
-    seed = tmp_path / "seed"
-    git(tmp_path, "init", "--quiet", "-b", BRANCH, str(seed))
+def build_gitenv(tmp_path: Path, key: str = "rot3k", github_repo: str = GITHUB_REPO) -> GitEnv:
+    root = tmp_path / key
+    root.mkdir()
+    origin = root / "origin.git"
+    git(root, "init", "--quiet", "--bare", str(origin))
+    seed = root / "seed"
+    git(root, "init", "--quiet", "-b", BRANCH, str(seed))
     (seed / "MANIFEST.md").write_bytes(b"# Manifest\n\nLine one.\n")
     (seed / "docs").mkdir()
     (seed / "docs" / "guide.md").write_bytes(b"Guide\n")
@@ -150,15 +160,20 @@ def gitenv(tmp_path: Path) -> GitEnv:
     git(seed, "push", "--quiet", "origin", "HEAD:refs/heads/main")
 
     repo_config = RepositoryConfig(
-        github_repo=GITHUB_REPO,
-        local_path=tmp_path / "cache" / "rot3k.git",
+        github_repo=github_repo,
+        local_path=tmp_path / "cache" / f"{key}.git",
         remote_url=str(origin),
         allowed_branches=[BRANCH],
         denied_paths=[".github/**"],
         validation=[],
     )
-    settings = Settings(work_dir=tmp_path / "work", repositories={"rot3k": repo_config})
-    return GitEnv(tmp=tmp_path, origin=origin, seed=seed, repo_config=repo_config, settings=settings)
+    settings = Settings(work_dir=tmp_path / "work", repositories={key: repo_config})
+    return GitEnv(tmp=tmp_path, origin=origin, seed=seed, repo_config=repo_config, settings=settings, key=key)
 
 
-__all__ = ["BRANCH", "GITHUB_REPO", "GitEnv", "ValidationCommand", "artifact_zip", "git", "make_zip", "request_for"]
+@pytest.fixture
+def gitenv(tmp_path: Path) -> GitEnv:
+    return build_gitenv(tmp_path)
+
+
+__all__ = ["BRANCH", "GITHUB_REPO", "GitEnv", "build_gitenv", "ValidationCommand", "artifact_zip", "git", "make_zip", "request_for"]

@@ -96,8 +96,15 @@ class Repository:
             raise ConfigError(f"local clone for {self.key!r} is not a usable repository") from exc
         if is_bare != "true":
             raise ConfigError(f"local clone for {self.key!r} must be a bare repository")
-        if actual_url != url:
-            raise ConfigError(f"local clone for {self.key!r} has an unexpected remote URL")
+        if actual_url in self.config.former_remote_urls:
+            # Declared GitHub rename: follow it rather than relying on redirects.
+            self.git.run(["remote", "set-url", remote, url])
+            log_event("clone_remote_renamed", repo=self.key, old=actual_url, new=url)
+        elif actual_url != url:
+            raise ConfigError(
+                f"local clone for {self.key!r} points at a different remote URL; "
+                "fix the configuration or delete the clone (it is a disposable cache)"
+            )
 
     def tracking_ref(self, branch: str) -> str:
         return f"refs/remotes/{self.config.remote}/{branch}"
@@ -133,7 +140,8 @@ class Repository:
         return self._execute(artifact, publish=True)
 
     def _authorise(self, req: PublishRequest) -> str:
-        if req.repository.casefold() != self.config.github_repo.casefold():
+        accepted = {name.casefold() for name in self.config.accepted_github_repos}
+        if req.repository.casefold() not in accepted:
             raise NotAllowed("repository in request.json does not match this endpoint's repository")
         for allowed in self.config.allowed_branches:
             if allowed == req.branch:

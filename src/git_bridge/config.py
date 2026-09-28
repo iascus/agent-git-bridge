@@ -29,6 +29,20 @@ def is_safe_branch_name(name: str) -> bool:
     return True
 
 
+def github_url(repo: str) -> str:
+    return f"https://github.com/{repo}.git"
+
+
+def _check_github_repo(v: str) -> str:
+    if not GITHUB_REPO_RE.match(v) or v.endswith((".git", ".")):
+        raise ValueError(f"invalid github_repo {v!r}; expected owner/name")
+    return v
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    return a == b or a.is_relative_to(b) or b.is_relative_to(a)
+
+
 class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -53,6 +67,9 @@ class ExportConfig(_Strict):
 
 class RepositoryConfig(_Strict):
     github_repo: str
+    # Previous names after a GitHub rename: still accepted in request.json, and
+    # a clone whose remote is the old GitHub URL is re-pointed automatically.
+    former_github_repos: list[str] = Field(default_factory=list)
     local_path: Path
     remote: str = "origin"
     remote_url: str | None = None
@@ -64,9 +81,12 @@ class RepositoryConfig(_Strict):
     @field_validator("github_repo")
     @classmethod
     def _check_repo(cls, v: str) -> str:
-        if not GITHUB_REPO_RE.match(v) or v.endswith((".git", ".")):
-            raise ValueError(f"invalid github_repo {v!r}; expected owner/name")
-        return v
+        return _check_github_repo(v)
+
+    @field_validator("former_github_repos")
+    @classmethod
+    def _check_former(cls, v: list[str]) -> list[str]:
+        return [_check_github_repo(r) for r in v]
 
     @field_validator("remote")
     @classmethod
@@ -87,7 +107,18 @@ class RepositoryConfig(_Strict):
 
     @property
     def effective_remote_url(self) -> str:
-        return self.remote_url or f"https://github.com/{self.github_repo}.git"
+        return self.remote_url or github_url(self.github_repo)
+
+    @property
+    def accepted_github_repos(self) -> list[str]:
+        return [self.github_repo, *self.former_github_repos]
+
+    @property
+    def former_remote_urls(self) -> list[str]:
+        """Old URLs a clone may be migrated from (only for default GitHub URLs)."""
+        if self.remote_url is not None:
+            return []
+        return [github_url(r) for r in self.former_github_repos]
 
 
 class GitIdentity(_Strict):
@@ -121,10 +152,31 @@ class Settings(_Strict):
         return v
 
     @model_validator(mode="after")
-    def _unique_paths(self) -> "Settings":
-        paths = [r.local_path.resolve() for r in self.repositories.values()]
-        if len(set(paths)) != len(paths):
-            raise ValueError("repositories must not share a local_path")
+    def _repositories_are_independent(self) -> "Settings":
+        """Each configured repository must own its GitHub name, clone and
+        export folder outright, so operations on one can never touch another."""
+        work_dir = self.work_dir.resolve()
+        seen_names: dict[str, str] = {}
+        paths: list[tuple[str, Path]] = []
+        drive_roots: list[tuple[str, str]] = []
+        for key, repo in self.repositories.items():
+            for name in repo.accepted_github_repos:
+                other = seen_names.setdefault(name.casefold(), key)
+                if other != key or repo.accepted_github_repos.count(name) > 1:
+                    raise ValueError(f"GitHub repository {name!r} is configured more than once")
+            path = repo.local_path.resolve()
+            if _overlaps(path, work_dir):
+                raise ValueError(f"local_path of {key!r} overlaps work_dir")
+            for other_key, other_path in paths:
+                if _overlaps(path, other_path):
+                    raise ValueError(f"local_path of {key!r} overlaps that of {other_key!r}")
+            paths.append((key, path))
+            if repo.export is not None:
+                root = repo.export.drive_root.strip("/")
+                for other_key, other_root in drive_roots:
+                    if root == other_root or root.startswith(other_root + "/") or other_root.startswith(root + "/"):
+                        raise ValueError(f"export.drive_root of {key!r} overlaps that of {other_key!r}")
+                drive_roots.append((key, root))
         return self
 
 
