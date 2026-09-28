@@ -118,6 +118,20 @@ def test_status_is_per_repository(multi: MultiEnv):
         assert status.branches[0].remote_sha == env.head()
 
 
+def test_stale_worktrees_cleaned_only_for_own_repository(multi: MultiEnv):
+    work = multi.settings.work_dir
+    work.mkdir(parents=True, exist_ok=True)
+    own_leftover = work / "rot3k.abc123"
+    other = work / "rot3k-extra.def456"  # a hypothetical key sharing the prefix
+    cyber = work / "cyberpunk-tactics.xyz"
+    for d in (own_leftover, other, cyber):
+        (d / "wt").mkdir(parents=True)
+    base, patch = multi.rot3k.make_patch({"a.md": "a\n"})
+    assert multi.repo(multi.rot3k).publish(multi.rot3k.artifact(patch, base)).ok
+    assert not own_leftover.exists()
+    assert other.exists() and cyber.exists()
+
+
 # ------------------------------------------------------------------ renames
 
 

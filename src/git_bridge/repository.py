@@ -290,6 +290,7 @@ class Repository:
             branch = self._authorise(req)
             with self.lock:
                 self.ensure_clone()
+                self._remove_stale_worktrees()
                 observed = self.fetch(branch)
                 outcome.observed_sha = observed
                 outcome.old_sha = observed
@@ -340,11 +341,23 @@ class Repository:
         )
         return outcome.summarise()
 
+    def _remove_stale_worktrees(self) -> None:
+        """Remove worktrees left by a killed process ("<key>.<random>"; keys
+        cannot contain "."). Caller holds self.lock,
+        so no live worktree of this repository can exist."""
+        work_dir = self.settings.work_dir
+        if work_dir.is_dir():
+            for leftover in work_dir.glob(f"{self.key}.*"):
+                if leftover.is_dir():
+                    shutil.rmtree(leftover, ignore_errors=True)
+                    self.events.emit("stale_worktree_removed", repo=self.key, name=leftover.name)
+        self.git.run(["worktree", "prune"], check=False)
+
     @contextmanager
     def _worktree(self, sha: str) -> Iterator[Path]:
         work_dir = self.settings.work_dir
         work_dir.mkdir(parents=True, exist_ok=True)
-        parent = Path(tempfile.mkdtemp(prefix=f"{self.key}-", dir=work_dir))
+        parent = Path(tempfile.mkdtemp(prefix=f"{self.key}.", dir=work_dir))
         path = parent / "wt"
         try:
             self.git.run(["worktree", "add", "--quiet", "--detach", str(path), sha])
