@@ -217,6 +217,9 @@ class ServerConfig(_Strict):
     host: str = "127.0.0.1"
     port: Annotated[int, Field(gt=0, lt=65536)] = 8000
     bearer_token_file: Path | None = None
+    # Records the running service so a restart can stop it first.
+    # Default: <work_dir>/../git-bridge-serve.pid
+    pid_file: Path | None = None
 
     @field_validator("host")
     @classmethod

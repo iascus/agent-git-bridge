@@ -242,7 +242,13 @@ def test_serve_binds_uvicorn_to_loopback(gitenv: GitEnv, monkeypatch):
     import uvicorn
 
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.update(kw))
+    from git_bridge import instance
+
+    calls = []
+    monkeypatch.setattr(instance, "stop_existing_instances", lambda port, pid_file: calls.append((port, pid_file)) or [])
+    monkeypatch.setattr(instance, "write_pid_file", lambda path: calls.append(("pid", path)))
     assert cli.serve(settings) == 0
+    assert calls == [(8000, gitenv.settings.work_dir.parent / "git-bridge-serve.pid"), ("pid", gitenv.settings.work_dir.parent / "git-bridge-serve.pid")]
     assert captured["host"] == "127.0.0.1"
     assert captured["port"] == 8000
     assert captured["workers"] == 1

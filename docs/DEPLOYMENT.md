@@ -103,6 +103,15 @@ deploy\windows\uninstall-task.ps1           # remove
 Get-Content $env:LOCALAPPDATA\agent-git-bridge\service.log -Tail 50
 ```
 
+**Single instance.** `git-bridge serve` stops any earlier bridge instance
+before it binds the port: the process listening on the configured port and
+the one recorded in the PID file (`server.pid_file`, default
+`<work_dir>/../git-bridge-serve.pid`), provided its command line shows it is
+a bridge `serve` process (the Windows venv launcher is stopped with it). A
+different program holding the port is never killed; startup fails with its
+name and PID instead. So `Start-ScheduledTask`, a manual `git-bridge serve`
+or a VS Code debug session each take over cleanly from whatever ran before.
+
 Use `git_extra_config: [http.sslBackend=schannel]` on Windows so HTTPS to
 GitHub uses the Windows certificate store (the bridge deliberately ignores the
 system Git configuration).

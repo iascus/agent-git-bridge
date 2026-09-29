@@ -43,10 +43,17 @@ def serve(settings: Settings) -> int:
 
     from .api import create_app
 
+    from .instance import stop_existing_instances, write_pid_file
+
     host, port = settings.server.host, settings.server.port
     if not is_loopback_host(host):  # also enforced by configuration validation
         raise ConfigError("refusing to listen on a non-loopback address")
-    app = create_app(settings)
+    app = create_app(settings)  # fail on bad configuration before stopping anything
+    pid_file = settings.server.pid_file or settings.work_dir.parent / "git-bridge-serve.pid"
+    stopped = stop_existing_instances(port, pid_file)
+    if stopped:
+        logging.getLogger("git_bridge").info("stopped previous service instance(s): %s", stopped)
+    write_pid_file(pid_file)
     uvicorn.run(
         app,
         host=host,
