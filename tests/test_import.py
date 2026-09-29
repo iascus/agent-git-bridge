@@ -363,8 +363,24 @@ def test_diff_render_includes_linked_file_table_of_contents(client: TestClient) 
     assert "function findDiffFileSections" in response.text
     assert "function renderDiffTableOfContents" in response.text
     assert 'nav.setAttribute("aria-label", "Changed files")' in response.text
-    assert "row.id = fileSection.id" in response.text
-    assert "diff-file-anchor:target" in response.text
+    assert "section.id = fileSection.id" in response.text
+    assert "diff-file-section:target" in response.text
+
+
+def test_diff_render_has_sticky_file_headers_clear_of_safe_area(client: TestClient) -> None:
+    client.post(
+        "/import",
+        content="diff a.py\n--- a.py\n+++ a.py\n@@ -1 +1 @@\n-x\n+y",
+        headers={**auth_headers(), "Content-Type": "text/plain"},
+    )
+
+    response = client.get("/render")
+
+    assert response.status_code == 200
+    assert "viewport-fit=cover" in response.text
+    assert "function renderDiffFileHeader" in response.text
+    assert "position: sticky;\n        top: env(safe-area-inset-top);" in response.text
+    assert "overflow-x: clip;" in response.text
 
 
 def test_diff_table_of_contents_counts_added_and_deleted_lines_per_file(
