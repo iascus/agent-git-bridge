@@ -115,6 +115,7 @@ it is skipped entirely when nothing changed.
 
 | Symptom | Cause |
 |---|---|
+| "The network connection was lost" (nothing in the bridge log) | A header is malformed, so Tailscale Serve rejects the HTTP/2 request before it reaches the bridge. Check that the header names are exactly `Authorization` and `Content-Type` (no spaces), and that the token in the **Text** action has no line break after it (tap at the end and delete any empty line). |
 | "Could not connect to the server" | Tailscale off on phone, bridge not running, or Serve entry missing (`tailscale serve status`). |
 | `Rejected (unauthorized)` | Token wrong/missing, or header not exactly `Bearer <token>`. |
 | `Rejected (invalid_artifact)` | The Shortcut altered the file (check Request Body is **File** → Shortcut Input), or ChatGPT produced a malformed ZIP. |

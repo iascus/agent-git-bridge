@@ -66,4 +66,6 @@ def write_token_file(path: Path, *, overwrite: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(generate_token() + "\n")
+        # No trailing newline: the value is copied into iOS Shortcuts, and a
+        # line break in an HTTP/2 header makes the request fail outright.
+        fh.write(generate_token())
