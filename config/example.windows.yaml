@@ -39,7 +39,7 @@ repositories:
     # After each successful push, open a PR from the branch into base
     # unless one is already open. Needs 'Pull requests: Read and write'.
     pull_request:
-      base: poc1
+      base: main
       draft: false
 
   cyberpunk-tactics:
