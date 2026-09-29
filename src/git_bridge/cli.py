@@ -106,6 +106,15 @@ def check(settings: Settings) -> int:
                 report(f"{key}: fetch {branch}", True, sha[:12])
         except BridgeError as exc:
             report(f"{key}: fetch", False, f"{exc.message} {exc.details.get('stderr', '')}".strip())
+        pr = repo.config.pull_request
+        if pr is not None and repo.github is not None:
+            for branch in repo.config.allowed_branches:
+                try:
+                    found = repo.github.find_open_pull_request(repo.config.github_repo, branch, pr.base)
+                    detail = f"open PR #{found['number']}" if found else "no open PR (one will be opened on publish)"
+                    report(f"{key}: pull requests {branch} -> {pr.base}", True, detail)
+                except BridgeError as exc:
+                    report(f"{key}: pull requests {branch} -> {pr.base}", False, exc.message)
     return 0 if ok else 1
 
 

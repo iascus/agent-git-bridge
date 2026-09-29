@@ -81,6 +81,7 @@ class GitEnv:
     key: str = "rot3k"
     limits: Limits = field(default_factory=Limits)
     store_factory: object = None
+    github: object = None
 
     @property
     def github_repo(self) -> str:
@@ -88,7 +89,7 @@ class GitEnv:
 
     @property
     def bridge(self) -> Bridge:
-        return Bridge(self.settings, store_factory=self.store_factory)
+        return Bridge(self.settings, store_factory=self.store_factory, github=self.github)
 
     @property
     def repo(self) -> Repository:

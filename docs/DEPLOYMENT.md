@@ -50,7 +50,9 @@ GitHub → *Settings → Developer settings → Fine-grained tokens → Generate
 
 - Resource owner: your account. Repository access: **only** the configured
   repositories.
-- Permissions: **Contents: Read and write** (Metadata read-only is implied).
+- Permissions: **Contents: Read and write** (Metadata read-only is implied),
+  and **Pull requests: Read and write** if `pull_request` is configured
+  (existing tokens can be edited: *Edit → Repository permissions*).
   Do **not** grant *Workflows* (prevents changes to `.github/workflows`), or
   administration permissions.
 - Set an expiry and a reminder to rotate it: replace the file, no restart

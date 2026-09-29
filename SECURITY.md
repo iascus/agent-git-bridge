@@ -55,6 +55,11 @@ configuration, and the patch is applied only in an isolated worktree.
 - No endpoint accepts Git arguments, shell commands, file paths, URLs or
   remote names. Git runs via fixed argument lists (`shell=False`) with values
   that are either server configuration or validated full-length hex SHAs.
+- Pull requests: with `pull_request.base` configured, the bridge only lists
+  open pull requests and opens one from the published branch into the
+  configured base. It never merges, closes, edits or comments. The token's
+  *Pull requests* permission would technically allow merging through the API;
+  the bridge contains no code path that does so.
 - Pushes use a plain refspec (`<sha>:refs/heads/<branch>`): no `+`, no
   `--force`, no `--force-with-lease`, no deletions, no tags, no ref rewriting.
 - Optimistic concurrency: the branch head must equal `expected_base_sha`

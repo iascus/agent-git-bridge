@@ -11,7 +11,8 @@ A small, security-conscious bridge between an AI conversation and Git:
   `changes.patch`). You share it from the iOS Share Sheet to a Shortcut, which
   POSTs it over private Tailscale HTTPS. The bridge verifies the expected base
   commit, applies and validates the patch in an isolated worktree, commits,
-  and pushes without force.
+  and pushes without force. Optionally it then opens a pull request into a
+  configured base branch if none is open.
 
 ```text
 GitHub ──► bridge ──► Google Drive ──► ChatGPT

@@ -31,6 +31,7 @@ from .errors import (
     ValidationFailed,
 )
 from .events import EventLog
+from .github import GitHubApi, GitHubClient
 from .gitcmd import Git, github_auth_env, minimal_env, tail
 from .results import (
     BranchStatus,
@@ -38,6 +39,7 @@ from .results import (
     CheckResult,
     ErrorInfo,
     PublishOutcome,
+    PullRequestInfo,
     RefreshOutcome,
     RepositoryStatus,
     SnapshotInfo,
@@ -71,12 +73,14 @@ class Repository:
         *,
         events: EventLog | None = None,
         store_factory: StoreFactory | None = None,
+        github: GitHubApi | None = None,
     ) -> None:
         self.key = key
         self.config = config
         self.settings = settings
         self.events = events or EventLog()
         self.store_factory = store_factory
+        self.github = github
         self.git = Git(
             config.local_path, timeout=settings.git_timeout_seconds, extra_config=settings.git_extra_config
         )
@@ -89,16 +93,23 @@ class Repository:
     # ------------------------------------------------------------------ setup
 
     def _network_env(self) -> dict[str, str]:
-        token_file = self.settings.github_token_file
-        if token_file is None or not self.config.effective_remote_url.startswith("https://github.com/"):
+        if self.settings.github_token_file is None or not self.config.effective_remote_url.startswith(
+            "https://github.com/"
+        ):
             return {}
+        return github_auth_env(self.github_token())
+
+    def github_token(self) -> str:
+        token_file = self.settings.github_token_file
+        if token_file is None:
+            raise ConfigError("github_token_file is not configured")
         try:
             token = token_file.read_text(encoding="utf-8").strip()
         except OSError as exc:
             raise ConfigError("cannot read GitHub token file") from exc
         if not token:
             raise ConfigError("GitHub token file is empty")
-        return github_auth_env(token)
+        return token
 
     def ensure_clone(self) -> None:
         """Create the persistent bare clone, or verify an existing one."""
@@ -265,6 +276,7 @@ class Repository:
         outcome = self.publish(artifact)
         if not outcome.ok or outcome.new_sha is None:
             return outcome
+        outcome.pull_request = self._ensure_pull_request(outcome)
         if self.config.export is None or self.store_factory is None:
             outcome.snapshot_refresh = "not_configured"
             return outcome.summarise()
@@ -308,6 +320,7 @@ class Repository:
             repository=req.repository,
             branch=req.branch,
             expected_base_sha=req.expected_base_sha,
+            commit_message=req.commit_message,
         )
         started = time.monotonic()
         try:
@@ -364,6 +377,42 @@ class Repository:
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         return outcome.summarise()
+
+    def _ensure_pull_request(self, outcome: PublishOutcome) -> PullRequestInfo | None:
+        """Open a PR from the published branch into its base unless one is open.
+        Failures are reported; they never undo or fail the push."""
+        cfg = self.config.pull_request
+        if cfg is None:
+            return None
+        head = outcome.branch
+        if head == cfg.base:
+            return PullRequestInfo(state="skipped", base=cfg.base, error="branch is the pull request base")
+        if self.github is None:
+            return PullRequestInfo(state="failed", base=cfg.base, error="no GitHub API client configured")
+        repo = self.config.github_repo
+        try:
+            existing = self.github.find_open_pull_request(repo, head, cfg.base)
+            if existing is not None:
+                info = PullRequestInfo(
+                    state="existing", number=existing.get("number"), url=existing.get("html_url"), base=cfg.base
+                )
+            else:
+                title = normalise_commit_message(outcome.commit_message or "").splitlines()[0][:200] or f"{head} → {cfg.base}"
+                body = (
+                    f"Opened automatically by Git Bridge after publishing `{(outcome.new_sha or '')[:12]}` "
+                    f"to `{head}`.\n\nLater publications to `{head}` are added to this pull request. "
+                    "Git Bridge never merges pull requests."
+                )
+                created = self.github.create_pull_request(repo, head, cfg.base, title, body, cfg.draft)
+                info = PullRequestInfo(
+                    state="created", number=created.get("number"), url=created.get("html_url"), base=cfg.base
+                )
+        except BridgeError as exc:
+            info = PullRequestInfo(state="failed", base=cfg.base, error=exc.message)
+        self.events.emit(
+            "pull_request", repo=self.key, head=head, base=cfg.base, state=info.state, number=info.number, error=info.error
+        )
+        return info
 
     def _remove_stale_worktrees(self) -> None:
         """Remove worktrees left by a killed process ("<key>.<random>"; keys
@@ -543,13 +592,19 @@ class Bridge:
         *,
         events: EventLog | None = None,
         store_factory: StoreFactory | None = None,
+        github: GitHubApi | None = None,
     ) -> None:
         self.settings = settings
         self.events = events or EventLog(settings.audit_log)
-        self._repositories = {
-            key: Repository(key, cfg, settings, events=self.events, store_factory=store_factory)
-            for key, cfg in settings.repositories.items()
-        }
+        self._repositories = {}
+        for key, cfg in settings.repositories.items():
+            repo = Repository(key, cfg, settings, events=self.events, store_factory=store_factory)
+            # Pull requests only for real GitHub remotes, with the bridge's own token.
+            if github is not None:
+                repo.github = github
+            elif cfg.pull_request is not None and cfg.remote_url is None and settings.github_token_file is not None:
+                repo.github = GitHubClient(repo.github_token)
+            self._repositories[key] = repo
 
     @property
     def keys(self) -> list[str]:

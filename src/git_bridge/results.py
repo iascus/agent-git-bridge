@@ -33,12 +33,21 @@ class ErrorInfo(BaseModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
+class PullRequestInfo(BaseModel):
+    state: Literal["created", "existing", "failed", "skipped"]
+    number: int | None = None
+    url: str | None = None
+    base: str | None = None
+    error: str | None = None
+
+
 class PublishOutcome(BaseModel):
     ok: bool = False
     operation: Literal["validate", "publish"]
     repository: str | None = None
     branch: str | None = None
     expected_base_sha: str | None = None
+    commit_message: str | None = Field(default=None, exclude=True)  # internal: PR title
     observed_sha: str | None = None
     old_sha: str | None = None
     new_sha: str | None = None
@@ -53,6 +62,8 @@ class PublishOutcome(BaseModel):
     snapshot_refresh: Literal["success", "failed", "skipped", "not_configured"] = "skipped"
     snapshot_commit: str | None = None
     snapshot_error: str | None = None
+    # Pull request from the branch into its configured base (if configured).
+    pull_request: PullRequestInfo | None = None
     error: ErrorInfo | None = None
     # One human-readable line, e.g. for display in an iOS Shortcut.
     message: str = ""
@@ -70,6 +81,13 @@ class PublishOutcome(BaseModel):
                 f"Published {(self.new_sha or '')[:12]} to {self.repository}@{self.branch}: "
                 f"{self.files_changed} file(s), +{self.insertions} -{self.deletions}."
             )
+            pr = self.pull_request
+            if pr is not None and pr.state == "created":
+                self.message += f" Opened PR #{pr.number} into {pr.base}: {pr.url}"
+            elif pr is not None and pr.state == "existing":
+                self.message += f" PR #{pr.number} into {pr.base} updated: {pr.url}"
+            elif pr is not None and pr.state == "failed":
+                self.message += f" PR creation FAILED: {pr.error}"
             if self.snapshot_refresh == "failed":
                 self.message += " Drive snapshot refresh FAILED; run Refresh Git Snapshot."
             elif self.snapshot_refresh == "success":

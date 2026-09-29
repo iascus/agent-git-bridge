@@ -77,6 +77,11 @@ repositories:
         - characters/index*.json
         - characters/index*.md
       exclude: []
+    # After each successful push, open a PR from the branch into base
+    # unless one is already open. Needs 'Pull requests: Read and write'.
+    pull_request:
+      base: poc1
+      draft: false
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics

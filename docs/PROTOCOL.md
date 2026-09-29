@@ -225,12 +225,20 @@ Every validate/publish response is one JSON object:
   "snapshot_refresh": "success",
   "snapshot_commit": "…",
   "snapshot_error": null,
+  "pull_request": {"state": "created", "number": 12, "url": "https://github.com/iascus/rt3k/pull/12", "base": "poc1", "error": null},
   "error": null,
   "message": "Published 0a1b2c3d4e5f to iascus/rt3k@design-docs: 1 file(s), +3 -1. Drive snapshot updated."
 }
 ```
 
 `message` is a single human-readable line suitable for display.
+
+`pull_request` is present when the repository configures `pull_request.base`:
+after a successful push the bridge looks for an open pull request from the
+branch into `base`; `state` is `existing` if one is open (the new commit is
+now part of it), `created` if the bridge opened one (title: the commit
+message's first line), or `failed` with `error` (the push still succeeded).
+The bridge never merges, closes or edits pull requests.
 
 | HTTP | `error.code` | Meaning |
 |---|---|---|

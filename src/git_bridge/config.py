@@ -104,6 +104,21 @@ class ExportConfig(_Strict):
         return self
 
 
+class PullRequestConfig(_Strict):
+    """Open a pull request from the published branch into ``base`` when none
+    is open. The bridge never merges, closes or edits pull requests."""
+
+    base: str
+    draft: bool = False
+
+    @field_validator("base")
+    @classmethod
+    def _check_base(cls, v: str) -> str:
+        if not is_safe_branch_name(v):
+            raise ValueError(f"invalid pull_request.base {v!r}")
+        return v
+
+
 class RepositoryConfig(_Strict):
     github_repo: str
     # Previous names after a GitHub rename: still accepted in request.json, and
@@ -116,6 +131,7 @@ class RepositoryConfig(_Strict):
     denied_paths: list[str] = Field(default_factory=list)
     validation: list[ValidationCommand] = Field(default_factory=list)
     export: ExportConfig | None = None
+    pull_request: PullRequestConfig | None = None
 
     @field_validator("github_repo")
     @classmethod

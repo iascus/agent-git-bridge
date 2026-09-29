@@ -54,7 +54,7 @@ credentials.
 
 The response `message` already reads e.g.:
 
-- `Published 0a1b2c3d4e5f to iascus/rt3k@design-docs: 2 file(s), +10 -3. Drive snapshot updated.`
+- `Published 0a1b2c3d4e5f to iascus/rt3k@design-docs: 2 file(s), +10 -3. Opened PR #12 into poc1: https://github.com/iascus/rt3k/pull/12 Drive snapshot updated.`
 - `Rejected (remote_changed): remote branch has moved; regenerate the patch against the current head`
 
 and `new_sha` is empty on rejection.
