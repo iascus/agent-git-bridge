@@ -29,7 +29,7 @@ def test_validate_patch_does_not_commit(gitenv: GitEnv):
     assert outcome.ok, outcome.error
     assert outcome.operation == "validate"
     assert outcome.new_sha is None
-    assert outcome.git_publish == "skipped"
+    assert outcome.git_push == "skipped"
     assert outcome.old_sha == base
     assert [(f.path, f.insertions, f.deletions) for f in outcome.changed_files] == [("MANIFEST.md", 1, 0)]
     assert outcome.validation.passed
@@ -45,9 +45,9 @@ def test_successful_publication(gitenv: GitEnv):
             "docs/guide.md": None,
         }
     )
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base, commit_message="Refine UI\n\nDetails here.  \n"))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base, commit_message="Refine UI\n\nDetails here.  \n"))
     assert outcome.ok, outcome.error
-    assert outcome.git_publish == "success"
+    assert outcome.git_push == "success"
     assert outcome.old_sha == base
     assert outcome.new_sha == gitenv.head()
     assert outcome.files_changed == 3
@@ -67,17 +67,20 @@ def test_successful_publication(gitenv: GitEnv):
 
 def test_consecutive_publications(gitenv: GitEnv):
     base, patch = gitenv.make_patch({"a.md": "a\n"})
-    first = gitenv.repo.publish(gitenv.artifact(patch, base))
+    first = gitenv.repo.push(gitenv.artifact(patch, base))
     base2, patch2 = gitenv.make_patch({"b.md": "b\n"})
     assert base2 == first.new_sha
-    second = gitenv.repo.publish(gitenv.artifact(patch2, base2))
+    second = gitenv.repo.push(gitenv.artifact(patch2, base2))
     assert second.ok and second.old_sha == first.new_sha
 
 
 def test_status_reports_remote_head(gitenv: GitEnv):
     status = gitenv.repo.status()
     assert status.repository == "iascus/rot3k"
-    assert [(b.branch, b.remote_sha) for b in status.branches] == [(BRANCH, gitenv.head())]
+    assert (status.integration.branch, status.integration.commit) == ("main", gitenv.head("main"))
+    assert (status.working.branch, status.working.commit) == (BRANCH, gitenv.head())
+    assert status.merge_base_commit == gitenv.head("main")  # fixture: both branches start equal
+    assert (status.working_ahead_by, status.working_behind_by) == (0, 0)
 
 
 # --------------------------------------------------------- concurrency safety
@@ -86,19 +89,19 @@ def test_status_reports_remote_head(gitenv: GitEnv):
 def test_wrong_expected_sha_is_409_and_nothing_applied(gitenv: GitEnv):
     base, patch = gitenv.make_patch({"MANIFEST.md": "changed\n"})
     moved = gitenv.advance_remote()
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert not outcome.ok
     assert outcome.error.code == "remote_changed"
     assert outcome.error.http_status == 409
     assert outcome.error.details == {"expected": base, "observed": moved}
-    assert outcome.git_publish == "failed"
+    assert outcome.git_push == "failed"
     assert gitenv.head() == moved
     assert outcome.changed_files == []
 
 
 def test_unknown_expected_sha_is_409(gitenv: GitEnv):
     _, patch = gitenv.make_patch({"MANIFEST.md": "changed\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, "f" * 40))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, "f" * 40))
     assert outcome.error.code == "remote_changed"
 
 
@@ -113,7 +116,7 @@ def test_concurrent_remote_update_before_push_is_rejected(gitenv: GitEnv, monkey
         return report
 
     monkeypatch.setattr(Repository, "_validate", validate_then_race)
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert not outcome.ok
     assert outcome.error.code == "push_race"
     assert outcome.error.http_status == 409
@@ -126,7 +129,7 @@ def test_push_rejected_by_remote_hook(gitenv: GitEnv):
     hook.write_text("#!/bin/sh\necho 'protected branch' >&2\nexit 1\n", newline="\n")
     hook.chmod(0o755)
     base, patch = gitenv.make_patch({"MANIFEST.md": "mine\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert not outcome.ok
     assert outcome.error.code == "push_rejected"
     assert outcome.error.http_status == 502
@@ -139,7 +142,7 @@ def test_push_rejected_by_remote_hook(gitenv: GitEnv):
 
 def test_disallowed_repository_in_request(gitenv: GitEnv):
     base, patch = gitenv.make_patch({"MANIFEST.md": "x\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base, repository="iascus/other"))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base, repository="iascus/other"))
     assert outcome.error.code == "not_allowed" and outcome.error.http_status == 403
     assert gitenv.head() == base
 
@@ -149,16 +152,32 @@ def test_unknown_repository_key(gitenv: GitEnv):
         gitenv.bridge.repository("other")
 
 
-def test_disallowed_branch(gitenv: GitEnv):
+def test_push_to_integration_branch_is_refused(gitenv: GitEnv):
     base, patch = gitenv.make_patch({"MANIFEST.md": "x\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base, branch="main"))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base, branch="main"))
     assert outcome.error.code == "not_allowed"
+    assert "working branch" in outcome.error.message
     assert git(gitenv.origin, "rev-parse", "refs/heads/main") == base
 
 
-def test_fetch_refuses_unlisted_branch(gitenv: GitEnv):
+def test_fetch_refuses_unconfigured_branch(gitenv: GitEnv):
     with pytest.raises(NotAllowed):
-        gitenv.repo.fetch("main")
+        gitenv.repo.fetch("poc1")
+
+
+def test_push_concurrency_is_checked_against_working_head_not_integration(gitenv: GitEnv):
+    # main moves on; a patch against the current working head must still apply.
+    gitenv.commit_to("main", {"main-only.md": "m\n"})
+    base, patch = gitenv.make_patch({"MANIFEST.md": "on working\n"})
+    assert base == gitenv.head() != gitenv.head("main")
+    out = gitenv.repo.push(gitenv.artifact(patch, base))
+    assert out.ok and git(gitenv.origin, "rev-parse", f"{out.new_sha}^") == base
+    # ...and main itself is never touched by a push.
+    assert gitenv.head("main") != out.new_sha
+    # A patch based on the integration head is stale for the working branch.
+    _, patch2 = gitenv.make_patch({"x.md": "x\n"})
+    stale = gitenv.repo.push(gitenv.artifact(patch2, gitenv.head("main")))
+    assert stale.error.code == "remote_changed"
 
 
 def test_existing_clone_with_different_remote_is_refused(gitenv: GitEnv):
@@ -177,7 +196,7 @@ def test_patch_that_does_not_apply(gitenv: GitEnv):
         b"diff --git a/MANIFEST.md b/MANIFEST.md\n--- a/MANIFEST.md\n+++ b/MANIFEST.md\n"
         b"@@ -1,1 +1,1 @@\n-no such line\n+replacement\n"
     )
-    outcome = gitenv.repo.publish(gitenv.artifact(bogus, base))
+    outcome = gitenv.repo.push(gitenv.artifact(bogus, base))
     assert outcome.error.code == "patch_does_not_apply"
     assert outcome.error.http_status == 422
     assert "MANIFEST.md" in outcome.error.details["stderr"]
@@ -192,7 +211,7 @@ def test_patch_escaping_tree_is_rejected(gitenv: GitEnv, target):
         f"diff --git a/{target} b/{target}\nnew file mode 100644\n--- /dev/null\n+++ b/{target}\n"
         "@@ -0,0 +1 @@\n+owned\n"
     ).encode()
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert not outcome.ok
     assert outcome.error.code == "patch_does_not_apply"
     assert not (gitenv.tmp / "outside.txt").exists()
@@ -205,7 +224,7 @@ def test_symlink_patch_rejected(gitenv: GitEnv):
         b"diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n"
         b"@@ -0,0 +1 @@\n+/etc/passwd\n\\ No newline at end of file\n"
     )
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert outcome.error.code == "patch_policy_violation"
     assert "symlink" in outcome.error.message
     assert gitenv.head() == base
@@ -213,14 +232,14 @@ def test_symlink_patch_rejected(gitenv: GitEnv):
 
 def test_denied_path_rejected(gitenv: GitEnv):
     base, patch = gitenv.make_patch({".github/workflows/ci.yml": "on: push\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert outcome.error.code == "patch_policy_violation"
     assert outcome.error.details["path"] == ".github/workflows/ci.yml"
 
 
 def test_binary_patch_rejected(gitenv: GitEnv):
     base, patch = gitenv.make_patch({"image.bin": bytes(range(256)) * 4}, binary=True)
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert outcome.error.code == "patch_policy_violation"
     assert "binary" in outcome.error.message
 
@@ -238,7 +257,7 @@ def test_patch_without_changes_rejected(gitenv: GitEnv):
 
 def test_whitespace_errors_fail_builtin_diff_check(gitenv: GitEnv):
     base, patch = gitenv.make_patch({"MANIFEST.md": "# Manifest\n\nLine one.   \n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert outcome.error.code == "validation_failed"
     check = outcome.validation.checks[0]
     assert check.name == "git diff --check" and not check.passed
@@ -251,7 +270,7 @@ def test_validation_command_failure_leaves_remote_untouched(gitenv: GitEnv):
         validation=[ValidationCommand(name="lint", command=[PY, "-c", "import sys; print('bad'); sys.exit(3)"])]
     )
     base, patch = gitenv.make_patch({"MANIFEST.md": "x\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert not outcome.ok
     assert outcome.error.code == "validation_failed"
     assert outcome.error.http_status == 422
@@ -298,7 +317,7 @@ def test_commit_contains_exactly_the_patch_even_if_validator_edits_files(gitenv:
     )
     gitenv.with_repo_config(validation=[ValidationCommand(command=[PY, "-c", script])])
     base, patch = gitenv.make_patch({"docs/guide.md": "Guide v2\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert outcome.ok, outcome.error
     changed = git(gitenv.origin, "diff", "--name-only", base, outcome.new_sha)
     assert changed == "docs/guide.md"

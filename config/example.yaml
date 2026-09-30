@@ -1,9 +1,9 @@
 # Example configuration for a Linux host (systemd); for Windows see
 # example.windows.yaml. Copy to /etc/git-bridge/config.yaml and edit.
-# Only repositories and branches listed here can ever be touched.
+# Only the repositories and branches configured here can ever be touched.
 # Secrets are separate files referenced by path, never stored in Git.
 
-work_dir: /var/lib/git-bridge/work             # temporary publication worktrees
+work_dir: /var/lib/git-bridge/work             # temporary push worktrees
 audit_log: /var/lib/git-bridge/audit.jsonl     # append-only JSON Lines
 github_token_file: /etc/git-bridge/github-token   # fine-grained PAT, mode 0600
 
@@ -29,14 +29,15 @@ limits:
   max_member_bytes: 16777216            # 16 MiB per archive member
   max_entries: 8
 
-# Each key is the stable name used in URLs (/repos/<key>/publish). Every
+# Each key is the stable project key used in URLs (/repos/<key>/push) and
+# artifact names; it is independent of the GitHub repository name. Every
 # repository gets its own bare clone, lock and Drive folder; GitHub names,
 # local_path and drive_root must not overlap between repositories.
 repositories:
   rot3k:
     # The GitHub repository is currently named rt3k. After renaming it on
     # GitHub, set github_repo: iascus/rot3k and former_github_repos: [iascus/rt3k]
-    # — the URL key, Shortcuts and Drive folder stay the same, in-flight
+    # -- the key, Shortcuts and Drive folder stay the same, in-flight push
     # artifacts naming rt3k are still accepted, and the clone is re-pointed.
     github_repo: iascus/rt3k
     former_github_repos: []
@@ -44,8 +45,11 @@ repositories:
     remote: origin
     # remote_url defaults to https://github.com/<github_repo>.git
 
-    allowed_branches:
-      - design-docs
+    # Integration branch: read only; exported as the complete snapshot.
+    integration_branch: main
+    # Working branch: the only branch a push may advance; exported as the
+    # integration -> working tree overlay.
+    working_branch: design-docs
 
     # Staged paths matching these globs are rejected.
     denied_paths:
@@ -60,43 +64,26 @@ repositories:
 
     export:
       drive_root: ChatGPT/rot3k
-      # Either: let the repository's manifest define the exported set, e.g.
-      #   manifest: docs/design/MANIFEST.md
-      # (reads its PROJECT_SOURCE_FILES / PROJECT_SOURCE_MATERIALIZATION
-      # blocks at the exported commit), or: glob rules as below.
-      bootstrap:
-        - MANIFEST.md
-        - PROJECT_WORKFLOW.md
-        - AGENTS.md
-        - docs/**/*.md
-      lazy:
-        - characters/**/*.md
-        - records/**/*.md
-        - romance/**/*.md
-      indexes:
-        - characters/index*.json
-        - characters/index*.md
-      exclude: []
-    # After each successful push, open a PR from the branch into base
-    # unless one is already open. Needs 'Pull requests: Read and write'.
+      # The repository's own manifest (PROJECT_SOURCE_FILES block) defines the
+      # exported files; each branch is read with its own manifest.
+      manifest: docs/design/MANIFEST.md
+      # Stable names (defaults shown):
+      # snapshot_name: rot3k-snapshot.zip
+      # working_diff_name: rot3k-working.diff
+
+    # After each successful push, open a PR working -> integration unless one
+    # is already open. Needs the token permission 'Pull requests: Read and write'.
     pull_request:
-      base: main
       draft: false
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
     local_path: /var/lib/git-bridge/repos/cyberpunk-tactics
-    allowed_branches:
-      - design-docs
+    integration_branch: main
+    working_branch: design-docs
     denied_paths:
       - .github/**
-    validation: []
     export:
       drive_root: ChatGPT/cyberpunk-tactics
-      bootstrap:
-        - "*.md"
-        - docs/**/*.md
-      lazy:
-        - "**/*.md"
-      indexes: []
-      exclude: []
+      manifest: docs/design/MANIFEST.md
+    pull_request: {}

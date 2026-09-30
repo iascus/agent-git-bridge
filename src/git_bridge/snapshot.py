@@ -1,13 +1,27 @@
-"""Snapshot generation (from Git objects of exactly one commit) and
-consistent export to a SnapshotStore.
+"""Refresh generations: integration snapshot + working-branch overlay.
 
-Archive format (default): one deterministic ZIP per repository containing
-snapshot.json and the selected files, replaced in place in a single write.
+One generation is built from one resolved pair of commits:
 
-Files format:
-  1. write snapshot.json with state "updating" (readers must not trust files)
-  2. upload changed files in place, remove files no longer exported
-  3. write the final snapshot.json with state "complete"  -- always last
+    M = integration branch head   (e.g. main)
+    D = working branch head       (e.g. design-docs)
+
+and produces two artifacts:
+
+    <key>-snapshot.zip    snapshot.json + the manifest-selected files of M
+    <key>-working.diff    the tree diff  sel(M) -> sel(D)
+
+where sel(X) is the tree of X restricted to the files X's own manifest
+lists (text files within the size limits). The overlay is computed between
+two synthetic trees built from exactly those files, so
+
+    unzip(snapshot) + git apply working.diff  ==  sel(D), byte for byte
+
+regardless of how the branches' histories relate (behind, ahead, divergent,
+rebased). The bridge never merges or rebases anything.
+
+Export order: the overlay is written first and the snapshot last; the
+snapshot's snapshot.json pins the overlay's SHA-256 and generation ID, so a
+reader can always detect a mismatched pair.
 """
 
 from __future__ import annotations
@@ -15,48 +29,38 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import mimetypes
+import os
+import re
 import secrets
+import tempfile
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from . import pathglob
 from .config import ExportConfig
-from .manifest import parse_manifest
-from .errors import SnapshotError
+from .errors import GitError, SnapshotError
 from .events import utc_now
 from .gitcmd import Git
-from .store import SNAPSHOT_NAME, FileMetadata, SnapshotStore, check_relative_path
+from .manifest import parse_manifest
+from .store import SNAPSHOT_NAME, SnapshotStore, check_relative_path
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
 READER_NOTES = (
-    "Exact export of one Git commit. If state is not 'complete', files may be "
-    "mid-update: wait and re-read snapshot.json. Read bootstrap and index files "
-    "at conversation start; read lazy files only when needed. A file whose "
-    "'exported' is false is listed for completeness but not present in Drive. "
-    "To propose changes, build publish.zip against 'commit' as expected_base_sha."
+    "Two Git states of one project. The files in this ZIP are the integration "
+    "branch at integration_commit (M). The working-branch overlay (working_diff) "
+    "is the exact tree diff from these files to the working branch at "
+    "working_commit (D): apply it with `git apply` to reconstruct D; if "
+    "working_diff.empty is true, D's files equal M's. First verify the overlay's "
+    "sha256 (and its '# generation:' header) against working_diff; on mismatch a "
+    "refresh is in progress, so fetch both files again. Pushes are made against "
+    "D: expected_base_sha = working_commit, changes.patch = D -> your HEAD."
 )
 
-_MIME_OVERRIDES = {
-    ".md": "text/markdown",
-    ".markdown": "text/markdown",
-    ".json": "application/json",
-    ".yaml": "text/plain",
-    ".yml": "text/plain",
-    ".toml": "text/plain",
-    ".csv": "text/csv",
-}
 
-
-def mime_type_for(path: str) -> str:
-    suffix = "." + path.rsplit(".", 1)[-1].lower() if "." in path.rsplit("/", 1)[-1] else ""
-    if suffix in _MIME_OVERRIDES:
-        return _MIME_OVERRIDES[suffix]
-    guessed, _ = mimetypes.guess_type(path)
-    return guessed if guessed and guessed.startswith("text/") else "text/plain"
+# --------------------------------------------------------------- git reading
 
 
 @dataclass(frozen=True)
@@ -67,10 +71,10 @@ class TreeEntry:
     size: int
 
 
-def list_tree(git: Git, commit: str) -> list[TreeEntry]:
-    """All blobs of ``commit`` (recursive). Submodules (gitlinks) are skipped."""
+def list_tree(git: Git, commit: str) -> dict[str, TreeEntry]:
+    """All blobs of ``commit`` (recursive). Submodules are skipped."""
     out = git.run(["ls-tree", "-r", "-z", "--long", "--full-tree", commit]).stdout
-    entries = []
+    entries: dict[str, TreeEntry] = {}
     for record in out.split(b"\0"):
         if not record:
             continue
@@ -79,7 +83,7 @@ def list_tree(git: Git, commit: str) -> list[TreeEntry]:
         if obj_type != "blob":
             continue
         path = raw_path.decode("utf-8", errors="surrogateescape")
-        entries.append(TreeEntry(path=path, mode=mode, blob_sha=sha, size=int(size)))
+        entries[path] = TreeEntry(path=path, mode=mode, blob_sha=sha, size=int(size))
     return entries
 
 
@@ -99,21 +103,8 @@ def read_blobs(git: Git, shas: list[str]) -> dict[str, bytes]:
         size = int(header[2])
         start = nl + 1
         blobs[sha] = out[start : start + size]
-        pos = start + size + 1  # trailing newline
+        pos = start + size + 1
     return blobs
-
-
-def classify(path: str, export: ExportConfig) -> str | None:
-    """bootstrap | index | lazy, or None when the path is not exported."""
-    if pathglob.match_any(path, export.exclude):
-        return None
-    if pathglob.match_any(path, export.bootstrap):
-        return "bootstrap"
-    if pathglob.match_any(path, export.indexes):
-        return "index"
-    if pathglob.match_any(path, export.lazy):
-        return "lazy"
-    return None
 
 
 def is_text(content: bytes) -> bool:
@@ -126,159 +117,123 @@ def is_text(content: bytes) -> bool:
     return True
 
 
+# ------------------------------------------------------------------ selection
+
+
 @dataclass
-class SnapshotBuild:
-    manifest: dict[str, Any]
-    # path -> content, only for files that will be exported
+class Selection:
+    """The exported files of one commit, as selected by its own manifest."""
+
+    commit: str
+    manifest_blob_sha: str
+    files: dict[str, TreeEntry] = field(default_factory=dict)
     contents: dict[str, bytes] = field(default_factory=dict)
+    not_exported: dict[str, str] = field(default_factory=dict)  # path -> reason
 
 
-def new_generation_id(commit: str) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{stamp}-{commit[:12]}-{secrets.token_hex(3)}"
-
-
-def build_snapshot(
-    git: Git,
-    *,
-    commit: str,
-    repository: str,
-    repository_key: str,
-    branch: str,
-    export: ExportConfig,
-) -> SnapshotBuild:
-    tree = git.text(["rev-parse", "--verify", "--end-of-options", f"{commit}^{{tree}}"])
-    entries = list_tree(git, commit)
-    selection_info: dict[str, Any]
-    # (entry, class, lazy class name)
-    selected: list[tuple[TreeEntry, str, str | None]] = []
-    missing: list[tuple[str, str, str | None]] = []
-    if export.manifest is not None:
-        by_path = {e.path: e for e in entries}
-        manifest_entry = by_path.get(export.manifest)
-        if manifest_entry is None:
-            raise SnapshotError(f"manifest {export.manifest} does not exist at commit {commit[:12]}")
-        selection = parse_manifest(read_blobs(git, [manifest_entry.blob_sha])[manifest_entry.blob_sha], export.manifest)
-        for path in selection.files:
-            if pathglob.match_any(path, export.exclude):
-                continue
-            file_class, lazy_class = selection.classify(path)
-            if path in by_path:
-                selected.append((by_path[path], file_class, lazy_class))
-            else:
-                missing.append((path, file_class, lazy_class))
-        selection_info = {"source": "manifest", "manifest": export.manifest, "manifest_blob_sha": manifest_entry.blob_sha}
-    else:
-        for entry in entries:
-            file_class = classify(entry.path, export)
-            if file_class is not None:
-                selected.append((entry, file_class, None))
-        selection_info = {"source": "rules"}
-
-    files: dict[str, dict[str, Any]] = {}
-    for path, file_class, lazy_class in missing:
-        files[path] = {"blob_sha": None, "size": 0, "class": file_class, "exported": False, "reason": "missing"}
-        if lazy_class:
-            files[path]["lazy_class"] = lazy_class
-    to_read: list[TreeEntry] = []
-    for entry, file_class, lazy_class in selected:
-        info: dict[str, Any] = {
-            "blob_sha": entry.blob_sha,
-            "size": entry.size,
-            "class": file_class,
-            "exported": False,
-        }
-        if lazy_class:
-            info["lazy_class"] = lazy_class
-        files[entry.path] = info
+def select_files(git: Git, commit: str, export: ExportConfig) -> Selection:
+    tree = list_tree(git, commit)
+    manifest_entry = tree.get(export.manifest)
+    if manifest_entry is None:
+        raise SnapshotError(f"manifest {export.manifest} does not exist at commit {commit[:12]}")
+    listed = parse_manifest(read_blobs(git, [manifest_entry.blob_sha])[manifest_entry.blob_sha], export.manifest)
+    selection = Selection(commit=commit, manifest_blob_sha=manifest_entry.blob_sha)
+    candidates: list[TreeEntry] = []
+    for path in listed:
+        entry = tree.get(path)
         try:
-            check_relative_path(entry.path)
-            entry.path.encode("utf-8")
-        except (SnapshotError, UnicodeEncodeError):
-            info["reason"] = "unsupported_path"
+            check_relative_path(path)  # also reserves snapshot.json for the manifest
+        except SnapshotError:
+            selection.not_exported[path] = "unsupported_path"
             continue
-        if entry.mode == "120000":
-            info["reason"] = "symlink"
+        if entry is None:
+            selection.not_exported[path] = "missing"
+        elif entry.mode == "120000":
+            selection.not_exported[path] = "symlink"
         elif entry.size > export.max_file_bytes:
-            info["reason"] = "too_large"
+            selection.not_exported[path] = "too_large"
         else:
-            to_read.append(entry)
-
-    total = sum(e.size for e in to_read)
+            candidates.append(entry)
+    total = sum(e.size for e in candidates)
     if total > export.max_total_bytes:
         raise SnapshotError(f"export would be {total} bytes, above max_total_bytes {export.max_total_bytes}")
-
-    blobs = read_blobs(git, [e.blob_sha for e in to_read])
-    contents: dict[str, bytes] = {}
-    for entry in to_read:
+    blobs = read_blobs(git, [e.blob_sha for e in candidates])
+    for entry in candidates:
         data = blobs[entry.blob_sha]
-        info = files[entry.path]
         if not is_text(data):
-            info["reason"] = "binary"
+            selection.not_exported[entry.path] = "binary"
             continue
-        info["exported"] = True
-        info["mime_type"] = mime_type_for(entry.path)
-        contents[entry.path] = data
+        selection.files[entry.path] = entry
+        selection.contents[entry.path] = data
+    return selection
 
-    manifest = {
-        "format_version": FORMAT_VERSION,
-        "state": "complete",
-        "generation_id": new_generation_id(commit),
-        "repository": repository,
-        "repository_key": repository_key,
-        "branch": branch,
-        "commit": commit,
-        "tree": tree,
-        "generated_at": None,  # set at publication time
-        "previous_commit": None,
-        "drive_root": export.drive_root,
-        "selection": selection_info,
-        "snapshot_file": SNAPSHOT_NAME,
-        "reader_notes": READER_NOTES,
-        "counts": {
-            "listed": len(files),
-            "exported": len(contents),
-            "bootstrap": sum(1 for f in files.values() if f["class"] == "bootstrap" and f["exported"]),
-            "index": sum(1 for f in files.values() if f["class"] == "index" and f["exported"]),
-            "lazy": sum(1 for f in files.values() if f["class"] == "lazy" and f["exported"]),
-            "missing": len(missing),
-        },
-        "files": dict(sorted(files.items())),
-    }
-    return SnapshotBuild(manifest=manifest, contents=contents)
+
+# ------------------------------------------------------------------- overlay
+
+
+def synthetic_tree(git: Git, entries: dict[str, TreeEntry]) -> str:
+    """Write a tree object containing exactly ``entries`` (via a throwaway index)."""
+    fd, index_path = tempfile.mkstemp(prefix="gb-index-")
+    os.close(fd)
+    os.unlink(index_path)  # git creates it
+    env = {"GIT_INDEX_FILE": index_path}
+    try:
+        if entries:
+            lines = b"".join(
+                f"{e.mode} {e.blob_sha}\t".encode("ascii") + e.path.encode("utf-8") + b"\0"
+                for e in sorted(entries.values(), key=lambda e: e.path)
+            )
+            git.run(["update-index", "-z", "--index-info"], input=lines, env=env)
+        return git.text(["write-tree"], env=env)
+    finally:
+        for suffix in ("", ".lock"):
+            try:
+                os.unlink(index_path + suffix)
+            except FileNotFoundError:
+                pass
+
+
+_DIFF_ARGS = ["-M", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"]
+
+
+def tree_diff(git: Git, from_tree: str, to_tree: str) -> bytes:
+    """Deterministic text patch transforming ``from_tree`` into ``to_tree``."""
+    return git.run(["diff-tree", "-p", *_DIFF_ARGS, from_tree, to_tree]).stdout
+
+
+def tree_diff_stats(git: Git, from_tree: str, to_tree: str) -> tuple[int, int, int]:
+    out = git.text(["diff-tree", "--shortstat", "-M", from_tree, to_tree])
+    numbers = {k: int(v) for v, k in re.findall(r"(\d+) (file|insertion|deletion)", out)}
+    return numbers.get("file", 0), numbers.get("insertion", 0), numbers.get("deletion", 0)
+
+
+# ----------------------------------------------------------------- generation
 
 
 @dataclass
-class ExportResult:
-    manifest: dict[str, Any]
-    uploaded: int = 0
-    unchanged: int = 0
-    deleted: int = 0
-    archive_name: str | None = None
-    archive_bytes: int | None = None
-    archive_sha256: str | None = None
+class Generation:
+    generation_id: str
+    fingerprint: str
+    manifest: dict[str, Any]  # snapshot.json
+    snapshot_name: str
+    snapshot_zip: bytes
+    diff_name: str
+    diff_bytes: bytes
 
 
-ARCHIVE_READER_NOTES = (
-    "Exact export of one Git commit as a single ZIP, replaced atomically. "
-    "Unzip it; this snapshot.json describes every file in the archive. Read "
-    "bootstrap files at conversation start and lazy files only when needed. "
-    "To propose changes, build publish.zip against 'commit' as expected_base_sha."
-)
-_ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
+def new_generation_id(integration: str, working: str) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{integration[:8]}-{working[:8]}-{secrets.token_hex(3)}"
 
 
-def archive_fingerprint(manifest: dict[str, Any]) -> str:
-    """Identifies archive content independent of generation time."""
-    material = {
-        "commit": manifest["commit"],
-        "selection": manifest.get("selection"),
-        "files": {
-            p: [f["blob_sha"], f["class"], f.get("lazy_class"), f["exported"], f.get("reason")]
-            for p, f in manifest["files"].items()
-        },
-    }
-    return hashlib.sha256(json.dumps(material, sort_keys=True).encode("utf-8")).hexdigest()
+def _branch_relationship(git: Git, integration: str, working: str) -> tuple[str | None, int | None, int | None]:
+    base = git.run(["merge-base", integration, working], check=False)
+    merge_base = base.text if base.returncode == 0 and base.text else None
+    try:
+        behind, ahead = git.text(["rev-list", "--left-right", "--count", f"{integration}...{working}"]).split()
+        return merge_base, int(ahead), int(behind)
+    except (GitError, ValueError):
+        return merge_base, None, None
 
 
 def build_archive(manifest: dict[str, Any], contents: dict[str, bytes]) -> bytes:
@@ -298,108 +253,143 @@ def build_archive(manifest: dict[str, Any], contents: dict[str, bytes]) -> bytes
     return buf.getvalue()
 
 
-def export_archive(store: SnapshotStore, build: SnapshotBuild, name: str) -> ExportResult:
-    manifest = dict(build.manifest)
-    manifest["reader_notes"] = ARCHIVE_READER_NOTES
-    manifest.pop("snapshot_file", None)
-    manifest["archive"] = name
+def build_generation(
+    git: Git,
+    *,
+    integration_commit: str,
+    working_commit: str,
+    repository: str,
+    project_key: str,
+    integration_branch: str,
+    working_branch: str,
+    export: ExportConfig,
+    snapshot_name: str,
+    diff_name: str,
+) -> Generation:
+    base = select_files(git, integration_commit, export)
+    work = select_files(git, working_commit, export)
+    base_tree = synthetic_tree(git, base.files)
+    work_tree = synthetic_tree(git, work.files)
+    body = tree_diff(git, base_tree, work_tree)
+    files_changed, insertions, deletions = tree_diff_stats(git, base_tree, work_tree)
+    merge_base, ahead, behind = _branch_relationship(git, integration_commit, working_commit)
+
+    fingerprint_material = {
+        "format_version": FORMAT_VERSION,
+        "integration": [integration_branch, integration_commit, base_tree, base.not_exported],
+        "working": [working_branch, working_commit, work_tree, work.not_exported],
+        "names": [snapshot_name, diff_name],
+    }
+    fingerprint = hashlib.sha256(json.dumps(fingerprint_material, sort_keys=True).encode()).hexdigest()
+    generation_id = new_generation_id(integration_commit, working_commit)
+
+    header = (
+        "# agent-git-bridge working-branch overlay\n"
+        f"# generation: {generation_id}\n"
+        f"# repository: {repository}\n"
+        f"# base: {integration_branch} {integration_commit}\n"
+        f"# target: {working_branch} {working_commit}\n"
+        f"# {'empty: the working tree equals the integration tree' if not body else 'apply to the unzipped snapshot with: git apply'}\n"
+        "\n"
+    ).encode("utf-8")
+    diff_bytes = header + body
+
+    manifest: dict[str, Any] = {
+        "format_version": FORMAT_VERSION,
+        "generation_id": generation_id,
+        "generated_at": utc_now(),
+        "repository": repository,
+        "project_key": project_key,
+        "integration_branch": integration_branch,
+        "integration_commit": integration_commit,
+        "working_branch": working_branch,
+        "working_commit": working_commit,
+        "merge_base_commit": merge_base,
+        "working_ahead_by": ahead,
+        "working_behind_by": behind,
+        "manifest_path": export.manifest,
+        "files": {p: {"blob_sha": e.blob_sha, "size": e.size} for p, e in sorted(base.files.items())},
+        "not_exported": dict(sorted(base.not_exported.items())),
+        "working_diff": {
+            "filename": diff_name,
+            "sha256": hashlib.sha256(diff_bytes).hexdigest(),
+            "bytes": len(diff_bytes),
+            "base_commit": integration_commit,
+            "target_commit": working_commit,
+            "empty": not body,
+            "files_changed": files_changed,
+            "insertions": insertions,
+            "deletions": deletions,
+            # What the working tree must look like after applying the overlay.
+            "working_files": {p: e.blob_sha for p, e in sorted(work.files.items())},
+            "working_not_exported": dict(sorted(work.not_exported.items())),
+        },
+        "reader_notes": READER_NOTES,
+    }
+    return Generation(
+        generation_id=generation_id,
+        fingerprint=fingerprint,
+        manifest=manifest,
+        snapshot_name=snapshot_name,
+        snapshot_zip=build_archive(manifest, base.contents),
+        diff_name=diff_name,
+        diff_bytes=diff_bytes,
+    )
+
+
+# --------------------------------------------------------------------- export
+
+
+@dataclass
+class ExportResult:
+    generation_id: str
+    uploaded: bool
+    snapshot_sha256: str
+    snapshot_bytes: int
+
+
+def export_generation(store: SnapshotStore, gen: Generation) -> ExportResult:
+    """Write the overlay, then the snapshot (last). Skip if unchanged."""
     try:
-        info = store.get_archive_info() or {}
-        manifest["previous_commit"] = info.get("commit")
-        fingerprint = archive_fingerprint(manifest)
-        result = ExportResult(manifest=manifest, archive_name=name)
-        if info.get("fingerprint") == fingerprint and info.get("name") == name:
-            result.unchanged = 1
-            manifest["generation_id"] = info.get("generation_id", manifest["generation_id"])
-            manifest["generated_at"] = info.get("generated_at")
-            result.archive_sha256 = info.get("sha256")
-            result.archive_bytes = int(info["bytes"]) if info.get("bytes", "").isdigit() else None
-        else:
-            manifest["generated_at"] = utc_now()
-            data = build_archive(manifest, build.contents)
-            digest = hashlib.sha256(data).hexdigest()
-            store.put_archive(
-                name,
-                data,
-                {
-                    "commit": manifest["commit"],
-                    "fingerprint": fingerprint,
-                    "generation_id": manifest["generation_id"],
-                    "generated_at": manifest["generated_at"],
-                    "sha256": digest,
-                    "bytes": str(len(data)),
-                    "files": str(len(build.contents)),
-                    "branch": manifest["branch"],
-                },
+        snap_info = store.get_artifact_info("snapshot") or {}
+        diff_info = store.get_artifact_info("working_diff") or {}
+        if (
+            snap_info.get("fingerprint") == gen.fingerprint
+            and diff_info.get("fingerprint") == gen.fingerprint
+            and snap_info.get("generation_id") == diff_info.get("generation_id")
+            and snap_info.get("name") == gen.snapshot_name
+            and diff_info.get("name") == gen.diff_name
+        ):
+            return ExportResult(
+                generation_id=snap_info["generation_id"],
+                uploaded=False,
+                snapshot_sha256=snap_info.get("sha256", ""),
+                snapshot_bytes=int(snap_info.get("bytes", 0)),
             )
-            result.uploaded = 1
-            result.archive_sha256 = digest
-            result.archive_bytes = len(data)
-        # Only after the archive is in place: drop artefacts of the files format.
-        result.deleted = store.remove_file_exports()
-        return result
-    except SnapshotError:
-        raise
-    except Exception as exc:  # transport failures (HTTP, auth, disk)
-        raise SnapshotError(f"snapshot export failed: {type(exc).__name__}: {str(exc)[:500]}") from exc
-
-
-def _previous_commit(store: SnapshotStore) -> str | None:
-    previous = store.get_snapshot()
-    if not previous:
-        return None
-    if previous.get("state") == "complete":
-        return previous.get("commit")
-    return previous.get("previous_commit")
-
-
-def export_snapshot(store: SnapshotStore, build: SnapshotBuild) -> ExportResult:
-    manifest = dict(build.manifest)
-    try:
-        previous_commit = _previous_commit(store)
-        manifest["previous_commit"] = previous_commit
-        store.put_snapshot(
-            {
-                "format_version": FORMAT_VERSION,
-                "state": "updating",
-                "generation_id": manifest["generation_id"],
-                "repository": manifest["repository"],
-                "repository_key": manifest["repository_key"],
-                "branch": manifest["branch"],
-                "previous_commit": previous_commit,
-                "target_commit": manifest["commit"],
-                "started_at": utc_now(),
-                "reader_notes": READER_NOTES,
-            }
+        m = gen.manifest
+        common = {
+            "generation_id": gen.generation_id,
+            "fingerprint": gen.fingerprint,
+            "integration_commit": m["integration_commit"],
+            "working_commit": m["working_commit"],
+            "generated_at": m["generated_at"],
+        }
+        store.put_artifact(
+            "working_diff",
+            gen.diff_name,
+            gen.diff_bytes,
+            "text/plain",
+            {**common, "sha256": m["working_diff"]["sha256"], "bytes": str(len(gen.diff_bytes))},
         )
-
-        result = ExportResult(manifest=manifest)
-        existing = store.existing_files()
-        files = {path: dict(info) for path, info in manifest["files"].items()}
-        for path, content in build.contents.items():
-            info = files[path]
-            current = existing.get(path)
-            if current is not None and current.blob_sha == info["blob_sha"]:
-                info["drive_file_id"] = current.file_id
-                result.unchanged += 1
-                continue
-            stored = store.put_file(
-                path,
-                content,
-                FileMetadata(
-                    blob_sha=info["blob_sha"], size=info["size"], file_class=info["class"], mime_type=info["mime_type"]
-                ),
-            )
-            info["drive_file_id"] = stored.file_id
-            result.uploaded += 1
-        for path in sorted(set(existing) - set(build.contents)):
-            store.delete_file(path)
-            result.deleted += 1
-
-        manifest["files"] = files
-        manifest["generated_at"] = utc_now()
-        store.put_snapshot(manifest)  # last: only now does the snapshot claim the new commit
-        return result
+        snapshot_sha = hashlib.sha256(gen.snapshot_zip).hexdigest()
+        store.put_artifact(
+            "snapshot",
+            gen.snapshot_name,
+            gen.snapshot_zip,
+            "application/zip",
+            {**common, "sha256": snapshot_sha, "bytes": str(len(gen.snapshot_zip)), "files": str(len(m["files"]))},
+        )
+        return ExportResult(gen.generation_id, True, snapshot_sha, len(gen.snapshot_zip))
     except SnapshotError:
         raise
     except Exception as exc:  # transport failures (HTTP, auth, disk)

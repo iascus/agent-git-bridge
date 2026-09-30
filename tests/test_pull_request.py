@@ -41,19 +41,19 @@ class FakeGitHub:
 
 @pytest.fixture
 def prenv(gitenv: GitEnv) -> GitEnv:
-    gitenv.with_repo_config(pull_request=PullRequestConfig(base="main"))
+    gitenv.with_repo_config(pull_request=PullRequestConfig())
     gitenv.github = FakeGitHub()
     return gitenv
 
 
-def _publish(env: GitEnv, message="Refine encounter UI\n\nLonger explanation."):
+def _push(env: GitEnv, message="Refine encounter UI\n\nLonger explanation."):
     base, patch = env.make_patch({"docs/pr.md": f"{len(env.github.calls)}\n"})
-    return env.repo.publish_and_refresh(env.artifact(patch, base, commit_message=message))
+    return env.repo.push_and_refresh(env.artifact(patch, base, commit_message=message))
 
 
 def test_first_publication_opens_pull_request(prenv: GitEnv):
-    out = _publish(prenv)
-    assert out.ok and out.git_publish == "success"
+    out = _push(prenv)
+    assert out.ok and out.git_push == "success"
     assert out.pull_request.state == "created"
     assert (out.pull_request.number, out.pull_request.url) == (7, "https://github.com/iascus/rot3k/pull/7")
     assert prenv.github.calls == [
@@ -65,8 +65,8 @@ def test_first_publication_opens_pull_request(prenv: GitEnv):
 
 
 def test_later_publication_reuses_open_pull_request(prenv: GitEnv):
-    _publish(prenv)
-    out = _publish(prenv, "Second change")
+    _push(prenv)
+    out = _push(prenv, "Second change")
     assert out.pull_request.state == "existing" and out.pull_request.number == 7
     assert [c[0] for c in prenv.github.calls] == ["find", "create", "find"]
     assert "PR #7 into main updated" in out.message
@@ -74,8 +74,8 @@ def test_later_publication_reuses_open_pull_request(prenv: GitEnv):
 
 def test_pull_request_failure_does_not_fail_publication(prenv: GitEnv):
     prenv.github = FakeGitHub(fail="find")
-    out = _publish(prenv)
-    assert out.ok and out.git_publish == "success" and out.new_sha == prenv.head()
+    out = _push(prenv)
+    assert out.ok and out.git_push == "success" and out.new_sha == prenv.head()
     assert out.pull_request.state == "failed" and "not accessible" in out.pull_request.error
     assert out.error is None
     assert "PR creation FAILED" in out.message
@@ -84,7 +84,7 @@ def test_pull_request_failure_does_not_fail_publication(prenv: GitEnv):
 def test_rejected_publication_does_not_touch_pull_requests(prenv: GitEnv):
     base, patch = prenv.make_patch({"a.md": "a\n"})
     prenv.advance_remote()
-    out = prenv.repo.publish_and_refresh(prenv.artifact(patch, base))
+    out = prenv.repo.push_and_refresh(prenv.artifact(patch, base))
     assert out.error.code == "remote_changed"
     assert out.pull_request is None and prenv.github.calls == []
 
@@ -98,19 +98,13 @@ def test_validate_patch_never_opens_pull_request(prenv: GitEnv):
 def test_not_configured_means_no_pull_request(gitenv: GitEnv):
     gitenv.github = FakeGitHub()
     base, patch = gitenv.make_patch({"a.md": "a\n"})
-    out = gitenv.repo.publish_and_refresh(gitenv.artifact(patch, base))
+    out = gitenv.repo.push_and_refresh(gitenv.artifact(patch, base))
     assert out.ok and out.pull_request is None and gitenv.github.calls == []
 
 
-def test_branch_equal_to_base_is_skipped(prenv: GitEnv):
-    prenv.with_repo_config(pull_request=PullRequestConfig(base=BRANCH))
-    out = _publish(prenv)
-    assert out.pull_request.state == "skipped" and prenv.github.calls == []
-
-
 def test_draft_option_and_commit_message_not_exposed(prenv: GitEnv):
-    prenv.with_repo_config(pull_request=PullRequestConfig(base="main", draft=True))
-    out = _publish(prenv, "Secret-ish subject line")
+    prenv.with_repo_config(pull_request=PullRequestConfig(draft=True))
+    out = _push(prenv, "Secret-ish subject line")
     assert prenv.github.calls[-1][-1] is True
     assert "commit_message" not in out.model_dump()
 
@@ -123,7 +117,7 @@ def test_real_client_only_for_github_remotes(tmp_path):
 
         cfg = RepositoryConfig(
             github_repo="iascus/rt3k", local_path=tmp_path / "r", remote_url=remote_url,
-            allowed_branches=["design-docs"], pull_request=PullRequestConfig(base="poc1"),
+            integration_branch="main", working_branch="design-docs", pull_request=PullRequestConfig(),
         )
         return Settings(work_dir=tmp_path / "w", github_token_file=token, repositories={"rot3k": cfg})
 
@@ -131,9 +125,10 @@ def test_real_client_only_for_github_remotes(tmp_path):
     assert Bridge(settings(str(tmp_path / "local.git"))).repository("rot3k").github is None
 
 
-def test_invalid_base_rejected():
-    with pytest.raises(ValueError):
-        PullRequestConfig(base="../main")
+def test_pull_request_targets_configured_integration_branch(prenv: GitEnv):
+    prenv.with_repo_config(integration_branch="trunk")
+    _push(prenv)
+    assert prenv.github.calls[0] == ("find", "iascus/rot3k", BRANCH, "trunk")
 
 
 # ------------------------------------------------------------ HTTP client

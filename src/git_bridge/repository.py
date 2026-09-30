@@ -1,5 +1,6 @@
-"""Per-repository Git operations: clone cache, fetch/status, and the guarded
-validate/publish pipeline running in an isolated temporary worktree."""
+"""Per-repository Git operations: clone cache, fetch/status, the guarded
+validate/push pipeline (isolated temporary worktree), and refresh of the
+integration snapshot + working-branch overlay."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from . import pathglob
-from .artifact import PublishArtifact, PublishRequest
+from .artifact import PushArtifact, PushRequest
 from .config import RepositoryConfig, Settings, ValidationCommand
 from .errors import (
     BridgeError,
@@ -34,18 +35,19 @@ from .events import EventLog
 from .github import GitHubApi, GitHubClient
 from .gitcmd import Git, github_auth_env, minimal_env, tail
 from .results import (
-    BranchStatus,
+    BranchHead,
     ChangedFile,
     CheckResult,
     ErrorInfo,
-    PublishOutcome,
     PullRequestInfo,
+    PushOutcome,
     RefreshOutcome,
     RepositoryStatus,
     SnapshotInfo,
     ValidationReport,
+    WorkingDiffInfo,
 )
-from .snapshot import build_snapshot, export_archive, export_snapshot
+from .snapshot import build_generation, export_generation
 from .store import SnapshotStore
 
 StoreFactory = Callable[["Repository"], SnapshotStore]
@@ -87,7 +89,7 @@ class Repository:
         # Git operations on this repository's clone are serialised...
         self.lock = threading.Lock()
         # ...and so are snapshot exports, separately, so a slow Drive upload
-        # never blocks a publication.
+        # never blocks a push.
         self.export_lock = threading.Lock()
 
     # ------------------------------------------------------------------ setup
@@ -142,51 +144,63 @@ class Repository:
     def tracking_ref(self, branch: str) -> str:
         return f"refs/remotes/{self.config.remote}/{branch}"
 
-    def fetch(self, branch: str) -> str:
-        """Fetch exactly one allowlisted branch; return its remote head SHA."""
-        if branch not in self.config.allowed_branches:
-            raise NotAllowed("branch is not allowed")
-        refspec = f"+refs/heads/{branch}:{self.tracking_ref(branch)}"
-        self.git.run(
-            ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", self.config.remote, refspec],
-            env=self._network_env(),
-        )
+    def _resolve(self, branch: str) -> str:
         return self.git.text(["rev-parse", "--verify", "--end-of-options", self.tracking_ref(branch) + "^{commit}"])
 
+    def fetch(self, *branches: str) -> dict[str, str]:
+        """Fetch the given configured branches in one operation; return their heads."""
+        for branch in branches:
+            if branch not in self.config.branches:
+                raise NotAllowed("branch is not configured for this repository")
+        refspecs = [f"+refs/heads/{b}:{self.tracking_ref(b)}" for b in branches]
+        self.git.run(
+            ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", self.config.remote, *refspecs],
+            env=self._network_env(),
+        )
+        return {b: self._resolve(b) for b in branches}
+
+    def fetch_heads(self) -> tuple[str, str]:
+        """(integration head M, working head D), resolved together."""
+        heads = self.fetch(*self.config.branches)
+        return heads[self.config.integration_branch], heads[self.config.working_branch]
+
+    def _relationship(self, integration: str, working: str) -> tuple[str | None, int | None, int | None]:
+        from .snapshot import _branch_relationship
+
+        return _branch_relationship(self.git, integration, working)
+
     def status(self) -> RepositoryStatus:
+        cfg = self.config
+        integration = BranchHead(branch=cfg.integration_branch)
+        working = BranchHead(branch=cfg.working_branch)
+        status = RepositoryStatus(repository=cfg.github_repo, key=self.key, integration=integration, working=working)
         with self.lock:
             self.ensure_clone()
-            branches = []
-            for branch in self.config.allowed_branches:
+            for head in (integration, working):
                 try:
-                    branches.append(BranchStatus(branch=branch, remote_sha=self.fetch(branch)))
+                    head.commit = self.fetch(head.branch)[head.branch]
                 except GitError as exc:
-                    branches.append(BranchStatus(branch=branch, remote_sha=None, error=exc.message))
-        status = RepositoryStatus(repository=self.config.github_repo, key=self.key, branches=branches)
-        if self.config.export is not None and self.store_factory is not None:
-            status.export_branch = self.config.export_branch
+                    head.error = exc.message
+            if integration.commit and working.commit:
+                status.merge_base_commit, status.working_ahead_by, status.working_behind_by = self._relationship(
+                    integration.commit, working.commit
+                )
+        if cfg.export is not None and self.store_factory is not None:
             try:
                 store = self.store_factory(self)
-                if self.config.export.format == "archive":
-                    info = store.get_archive_info() or {}
-                    files = info.get("files", "")
-                    status.snapshot = SnapshotInfo(
-                        state="complete" if info else None,
-                        commit=info.get("commit"),
-                        generation_id=info.get("generation_id"),
-                        generated_at=info.get("generated_at"),
-                        file_count=int(files) if files.isdigit() else None,
-                        archive=info.get("name"),
-                    )
-                else:
-                    current = store.get_snapshot() or {}
-                    status.snapshot = SnapshotInfo(
-                        state=current.get("state"),
-                        commit=current.get("commit") or current.get("target_commit"),
-                        generation_id=current.get("generation_id"),
-                        generated_at=current.get("generated_at"),
-                        file_count=(current.get("counts") or {}).get("exported"),
-                    )
+                snap = store.get_artifact_info("snapshot") or {}
+                diff = store.get_artifact_info("working_diff") or {}
+                files = snap.get("files", "")
+                status.snapshot = SnapshotInfo(
+                    generation_id=snap.get("generation_id"),
+                    generated_at=snap.get("generated_at"),
+                    integration_commit=snap.get("integration_commit"),
+                    working_commit=snap.get("working_commit"),
+                    snapshot_name=snap.get("name"),
+                    working_diff_name=diff.get("name"),
+                    file_count=int(files) if files.isdigit() else None,
+                    consistent=bool(snap) and snap.get("generation_id") == diff.get("generation_id"),
+                )
             except Exception as exc:  # status must still report Git state
                 status.snapshot = SnapshotInfo(error=f"{type(exc).__name__}: {str(exc)[:300]}")
         return status
@@ -194,9 +208,14 @@ class Repository:
     # --------------------------------------------------------------- snapshot
 
     @property
-    def archive_name(self) -> str:
+    def snapshot_name(self) -> str:
         export = self.config.export
-        return (export.archive_name if export and export.archive_name else f"{self.key}-snapshot.zip")
+        return export.snapshot_name if export and export.snapshot_name else f"{self.key}-snapshot.zip"
+
+    @property
+    def working_diff_name(self) -> str:
+        export = self.config.export
+        return export.working_diff_name if export and export.working_diff_name else f"{self.key}-working.diff"
 
     def _store(self) -> SnapshotStore:
         if self.config.export is None:
@@ -210,85 +229,99 @@ class Repository:
         except Exception as exc:
             raise SnapshotError(f"cannot open snapshot store: {type(exc).__name__}: {str(exc)[:300]}") from exc
 
-    def refresh(self, *, commit: str | None = None) -> RefreshOutcome:
-        """Export the configured branch (or ``commit``, which must be on it)."""
-        branch = self.config.export_branch
-        outcome = RefreshOutcome(repository=self.config.github_repo, key=self.key, branch=branch)
+    def refresh(self) -> RefreshOutcome:
+        """Resolve both branch heads together and export one generation:
+        the integration snapshot and the integration -> working overlay."""
+        cfg = self.config
+        outcome = RefreshOutcome(
+            repository=cfg.github_repo,
+            key=self.key,
+            integration_branch=cfg.integration_branch,
+            working_branch=cfg.working_branch,
+        )
         started = time.monotonic()
         try:
             store = self._store()
             with self.lock:
                 self.ensure_clone()
-                head = self.fetch(branch)
-                target = commit or head
-                if commit is not None:
-                    # Only export commits that really are part of the remote branch.
-                    reachable = self.git.run(["merge-base", "--is-ancestor", commit, head], check=False)
-                    if reachable.returncode != 0:
-                        raise SnapshotError("commit is not on the remote branch", commit=commit, head=head)
-                build = build_snapshot(
+                integration, working = self.fetch_heads()
+                gen = build_generation(
                     self.git,
-                    commit=target,
-                    repository=self.config.github_repo,
-                    repository_key=self.key,
-                    branch=branch,
-                    export=self.config.export,
+                    integration_commit=integration,
+                    working_commit=working,
+                    repository=cfg.github_repo,
+                    project_key=self.key,
+                    integration_branch=cfg.integration_branch,
+                    working_branch=cfg.working_branch,
+                    export=cfg.export,
+                    snapshot_name=self.snapshot_name,
+                    diff_name=self.working_diff_name,
                 )
             with self.export_lock:
-                if self.config.export.format == "archive":
-                    result = export_archive(store, build, self.archive_name)
-                else:
-                    result = export_snapshot(store, build)
-            m = result.manifest
+                result = export_generation(store, gen)
+            m = gen.manifest
+            d = m["working_diff"]
             outcome.ok = True
-            outcome.commit = target
-            outcome.previous_commit = m["previous_commit"]
-            outcome.generation_id = m["generation_id"]
-            outcome.file_count = m["counts"]["listed"]
-            outcome.exported = m["counts"]["exported"]
-            outcome.not_exported = m["counts"]["listed"] - m["counts"]["exported"]
-            outcome.uploaded, outcome.unchanged, outcome.deleted = result.uploaded, result.unchanged, result.deleted
-            outcome.archive_name = result.archive_name
-            outcome.archive_bytes = result.archive_bytes
-            outcome.archive_sha256 = result.archive_sha256
+            outcome.integration_commit = integration
+            outcome.working_commit = working
+            outcome.merge_base_commit = m["merge_base_commit"]
+            outcome.working_ahead_by = m["working_ahead_by"]
+            outcome.working_behind_by = m["working_behind_by"]
+            outcome.generation_id = result.generation_id
+            outcome.uploaded = result.uploaded
+            outcome.snapshot_name = gen.snapshot_name
+            outcome.snapshot_sha256 = result.snapshot_sha256
+            outcome.snapshot_bytes = result.snapshot_bytes
+            outcome.file_count = len(m["files"])
+            outcome.not_exported = len(m["not_exported"])
+            outcome.working_diff = WorkingDiffInfo(
+                filename=d["filename"],
+                sha256=d["sha256"] if result.uploaded else (store.get_artifact_info("working_diff") or {}).get("sha256", d["sha256"]),
+                bytes=d["bytes"],
+                empty=d["empty"],
+                files_changed=d["files_changed"],
+                insertions=d["insertions"],
+                deletions=d["deletions"],
+            )
         except BridgeError as exc:
             outcome.error = _error_info(exc)
         self.events.emit(
             "refresh",
             repo=self.key,
-            repository=self.config.github_repo,
-            branch=branch,
-            commit=outcome.commit,
+            repository=cfg.github_repo,
+            integration_commit=outcome.integration_commit,
+            working_commit=outcome.working_commit,
             generation_id=outcome.generation_id,
+            uploaded=outcome.uploaded,
             ok=outcome.ok,
             error=outcome.error.code if outcome.error else None,
             error_message=outcome.error.message if outcome.error else None,
-            exported=outcome.exported,
-            uploaded=outcome.uploaded,
-            deleted=outcome.deleted,
+            files=outcome.file_count,
+            overlay_files=outcome.working_diff.files_changed if outcome.working_diff else None,
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         return outcome.summarise()
 
-    def publish_and_refresh(self, artifact: PublishArtifact) -> PublishOutcome:
-        """Publish, then export the newly published commit. A snapshot
-        failure is reported but never turns a successful push into a failure."""
-        outcome = self.publish(artifact)
+    def push_and_refresh(self, artifact: PushArtifact) -> PushOutcome:
+        """Push to the working branch, open a PR if configured, then refresh
+        the snapshot from the branch heads as they now are. Failures after the
+        push are reported but never turn a successful push into a failure."""
+        outcome = self.push(artifact)
         if not outcome.ok or outcome.new_sha is None:
             return outcome
         outcome.pull_request = self._ensure_pull_request(outcome)
         if self.config.export is None or self.store_factory is None:
             outcome.snapshot_refresh = "not_configured"
             return outcome.summarise()
-        refreshed = self.refresh(commit=outcome.new_sha)
+        refreshed = self.refresh()
         if refreshed.ok:
             outcome.snapshot_refresh = "success"
-            outcome.snapshot_commit = refreshed.commit
+            outcome.snapshot_generation_id = refreshed.generation_id
         else:
             outcome.snapshot_refresh = "failed"
             outcome.snapshot_error = refreshed.error.message if refreshed.error else "unknown error"
         self.events.emit(
-            "publish_snapshot",
+            "push_snapshot",
             repo=self.key,
             new_sha=outcome.new_sha,
             snapshot_refresh=outcome.snapshot_refresh,
@@ -298,25 +331,27 @@ class Repository:
 
     # --------------------------------------------------------------- pipeline
 
-    def validate_patch(self, artifact: PublishArtifact) -> PublishOutcome:
-        return self._execute(artifact, publish=False)
+    def validate_patch(self, artifact: PushArtifact) -> PushOutcome:
+        return self._execute(artifact, push=False)
 
-    def publish(self, artifact: PublishArtifact) -> PublishOutcome:
-        return self._execute(artifact, publish=True)
+    def push(self, artifact: PushArtifact) -> PushOutcome:
+        return self._execute(artifact, push=True)
 
-    def _authorise(self, req: PublishRequest) -> str:
+    def _authorise(self, req: PushRequest) -> str:
         accepted = {name.casefold() for name in self.config.accepted_github_repos}
         if req.repository.casefold() not in accepted:
             raise NotAllowed("repository in request.json does not match this endpoint's repository")
-        for allowed in self.config.allowed_branches:
-            if allowed == req.branch:
-                return allowed  # use the configured string from here on
-        raise NotAllowed("branch is not in the allowlist for this repository")
+        if req.branch != self.config.working_branch:
+            raise NotAllowed(
+                f"pushes may only target the working branch {self.config.working_branch!r}",
+                branch=req.branch,
+            )
+        return self.config.working_branch  # the configured string from here on
 
-    def _execute(self, artifact: PublishArtifact, *, publish: bool) -> PublishOutcome:
+    def _execute(self, artifact: PushArtifact, *, push: bool) -> PushOutcome:
         req = artifact.request
-        outcome = PublishOutcome(
-            operation="publish" if publish else "validate",
+        outcome = PushOutcome(
+            operation="push" if push else "validate",
             repository=req.repository,
             branch=req.branch,
             expected_base_sha=req.expected_base_sha,
@@ -328,7 +363,7 @@ class Repository:
             with self.lock:
                 self.ensure_clone()
                 self._remove_stale_worktrees()
-                observed = self.fetch(branch)
+                observed = self.fetch(branch)[branch]
                 outcome.observed_sha = observed
                 outcome.old_sha = observed
                 if observed != req.expected_base_sha:
@@ -348,17 +383,17 @@ class Repository:
                     outcome.validation = self._validate(wt_git, wt, req.expected_base_sha)
                     if not outcome.validation.passed:
                         raise ValidationFailed("validation failed; nothing was committed")
-                    if publish:
+                    if push:
                         new_sha = self._commit(tree, req.expected_base_sha, req.commit_message)
                         self._push(new_sha, branch)
                         outcome.new_sha = new_sha
-                        outcome.git_publish = "success"
+                        outcome.git_push = "success"
                         self._refresh_tracking_ref(branch)
                 outcome.ok = True
         except BridgeError as exc:
             outcome.ok = False
-            if publish:
-                outcome.git_publish = "failed"
+            if push:
+                outcome.git_push = "failed"
             outcome.error = _error_info(exc)
         self.events.emit(
             outcome.operation,
@@ -378,39 +413,33 @@ class Repository:
         )
         return outcome.summarise()
 
-    def _ensure_pull_request(self, outcome: PublishOutcome) -> PullRequestInfo | None:
-        """Open a PR from the published branch into its base unless one is open.
-        Failures are reported; they never undo or fail the push."""
+    def _ensure_pull_request(self, outcome: PushOutcome) -> PullRequestInfo | None:
+        """Open a PR from the working branch into the integration branch unless
+        one is open. Failures are reported; they never undo or fail the push."""
         cfg = self.config.pull_request
         if cfg is None:
             return None
-        head = outcome.branch
-        if head == cfg.base:
-            return PullRequestInfo(state="skipped", base=cfg.base, error="branch is the pull request base")
+        head, base = self.config.working_branch, self.config.integration_branch
         if self.github is None:
-            return PullRequestInfo(state="failed", base=cfg.base, error="no GitHub API client configured")
+            return PullRequestInfo(state="failed", base=base, error="no GitHub API client configured")
         repo = self.config.github_repo
         try:
-            existing = self.github.find_open_pull_request(repo, head, cfg.base)
+            existing = self.github.find_open_pull_request(repo, head, base)
             if existing is not None:
-                info = PullRequestInfo(
-                    state="existing", number=existing.get("number"), url=existing.get("html_url"), base=cfg.base
-                )
+                info = PullRequestInfo(state="existing", number=existing.get("number"), url=existing.get("html_url"), base=base)
             else:
-                title = normalise_commit_message(outcome.commit_message or "").splitlines()[0][:200] or f"{head} → {cfg.base}"
+                title = normalise_commit_message(outcome.commit_message or "").splitlines()[0][:200] or f"{head} → {base}"
                 body = (
-                    f"Opened automatically by Git Bridge after publishing `{(outcome.new_sha or '')[:12]}` "
-                    f"to `{head}`.\n\nLater publications to `{head}` are added to this pull request. "
+                    f"Opened automatically by Git Bridge after pushing `{(outcome.new_sha or '')[:12]}` "
+                    f"to `{head}`.\n\nLater pushes to `{head}` are added to this pull request. "
                     "Git Bridge never merges pull requests."
                 )
-                created = self.github.create_pull_request(repo, head, cfg.base, title, body, cfg.draft)
-                info = PullRequestInfo(
-                    state="created", number=created.get("number"), url=created.get("html_url"), base=cfg.base
-                )
+                created = self.github.create_pull_request(repo, head, base, title, body, cfg.draft)
+                info = PullRequestInfo(state="created", number=created.get("number"), url=created.get("html_url"), base=base)
         except BridgeError as exc:
-            info = PullRequestInfo(state="failed", base=cfg.base, error=exc.message)
+            info = PullRequestInfo(state="failed", base=base, error=exc.message)
         self.events.emit(
-            "pull_request", repo=self.key, head=head, base=cfg.base, state=info.state, number=info.number, error=info.error
+            "pull_request", repo=self.key, head=head, base=base, state=info.state, number=info.number, error=info.error
         )
         return info
 
@@ -476,7 +505,7 @@ class Repository:
             if pathglob.match_any(path, self.config.denied_paths):
                 raise PatchPolicyViolation("patch touches a denied path", path=path)
 
-    def _collect_stats(self, git: Git, base: str, outcome: PublishOutcome) -> None:
+    def _collect_stats(self, git: Git, base: str, outcome: PushOutcome) -> None:
         raw = git.run(["diff", "--cached", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base])
         changed = []
         for record in raw.stdout.split(b"\0"):

@@ -59,22 +59,16 @@ class ValidationCommand(_Strict):
 
 
 class ExportConfig(_Strict):
+    """What ChatGPT receives per refresh: a complete snapshot of the
+    integration branch and the integration -> working tree overlay."""
+
     drive_root: str
-    # Branch to export; defaults to the first allowed branch.
-    branch: str | None = None
-    # Repository path of a source manifest whose project_source_files block
-    # defines the exported file set (and whose optional materialization block
-    # defines bootstrap/lazy). Mutually exclusive with bootstrap/lazy/indexes.
-    manifest: str | None = None
-    # "archive": one ZIP per repository, replaced in place under a stable
-    # name (default "<key>-snapshot.zip") -- atomic for readers.
-    # "files": every file individually plus snapshot.json.
-    format: Literal["archive", "files"] = "archive"
-    archive_name: str | None = None
-    bootstrap: list[str] = Field(default_factory=list)
-    lazy: list[str] = Field(default_factory=list)
-    indexes: list[str] = Field(default_factory=list)
-    exclude: list[str] = Field(default_factory=list)
+    # Repository path of the source manifest whose PROJECT_SOURCE_FILES block
+    # defines the exported file set. Read from each branch's own commit.
+    manifest: str
+    # Stable artifact names (defaults: <key>-snapshot.zip, <key>-working.diff).
+    snapshot_name: str | None = None
+    working_diff_name: str | None = None
     max_file_bytes: Annotated[int, Field(gt=0)] = 10 * 1024 * 1024
     max_total_bytes: Annotated[int, Field(gt=0)] = 200 * 1024 * 1024
 
@@ -86,37 +80,35 @@ class ExportConfig(_Strict):
             raise ValueError(f"invalid drive_root {v!r}")
         return "/".join(parts)
 
-    @field_validator("archive_name")
+    @field_validator("manifest")
     @classmethod
-    def _check_archive_name(cls, v: str | None) -> str | None:
-        if v is not None and (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}\.zip", v)):
-            raise ValueError(f"archive_name {v!r} must be a plain file name ending in .zip")
+    def _check_manifest(cls, v: str) -> str:
+        parts = v.split("/")
+        if v.startswith("/") or any(p in ("", ".", "..") for p in parts):
+            raise ValueError(f"invalid export.manifest path {v!r}")
         return v
 
-    @model_validator(mode="after")
-    def _one_selection_method(self) -> "ExportConfig":
-        if self.manifest is not None:
-            if self.bootstrap or self.lazy or self.indexes:
-                raise ValueError("export.manifest cannot be combined with bootstrap/lazy/indexes rules")
-            parts = self.manifest.split("/")
-            if self.manifest.startswith("/") or any(p in ("", ".", "..") for p in parts):
-                raise ValueError(f"invalid export.manifest path {self.manifest!r}")
-        return self
+    @field_validator("snapshot_name")
+    @classmethod
+    def _check_snapshot_name(cls, v: str | None) -> str | None:
+        if v is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}\.zip", v):
+            raise ValueError(f"snapshot_name {v!r} must be a plain file name ending in .zip")
+        return v
+
+    @field_validator("working_diff_name")
+    @classmethod
+    def _check_diff_name(cls, v: str | None) -> str | None:
+        if v is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,100}\.(diff|patch)", v):
+            raise ValueError(f"working_diff_name {v!r} must be a plain file name ending in .diff or .patch")
+        return v
 
 
 class PullRequestConfig(_Strict):
-    """Open a pull request from the published branch into ``base`` when none
-    is open. The bridge never merges, closes or edits pull requests."""
+    """After a push, open a pull request from the working branch into the
+    integration branch unless one is open. The bridge never merges, closes or
+    edits pull requests."""
 
-    base: str
     draft: bool = False
-
-    @field_validator("base")
-    @classmethod
-    def _check_base(cls, v: str) -> str:
-        if not is_safe_branch_name(v):
-            raise ValueError(f"invalid pull_request.base {v!r}")
-        return v
 
 
 class RepositoryConfig(_Strict):
@@ -127,7 +119,10 @@ class RepositoryConfig(_Strict):
     local_path: Path
     remote: str = "origin"
     remote_url: str | None = None
-    allowed_branches: Annotated[list[str], Field(min_length=1)]
+    # Integration: read only, exported as the complete baseline (e.g. main).
+    integration_branch: str
+    # Working: the only branch a push may advance (e.g. design-docs).
+    working_branch: str
     denied_paths: list[str] = Field(default_factory=list)
     validation: list[ValidationCommand] = Field(default_factory=list)
     export: ExportConfig | None = None
@@ -150,28 +145,22 @@ class RepositoryConfig(_Strict):
             raise ValueError(f"invalid remote name {v!r}")
         return v
 
-    @field_validator("allowed_branches")
+    @field_validator("integration_branch", "working_branch")
     @classmethod
-    def _check_branches(cls, v: list[str]) -> list[str]:
-        for b in v:
-            if not is_safe_branch_name(b):
-                raise ValueError(f"invalid branch name {b!r}")
-        if len(set(v)) != len(v):
-            raise ValueError("duplicate allowed_branches entry")
+    def _check_branch(cls, v: str) -> str:
+        if not is_safe_branch_name(v):
+            raise ValueError(f"invalid branch name {v!r}")
         return v
 
     @model_validator(mode="after")
-    def _export_branch_allowed(self) -> "RepositoryConfig":
-        if self.export is not None and self.export.branch is not None:
-            if self.export.branch not in self.allowed_branches:
-                raise ValueError("export.branch must be one of allowed_branches")
+    def _distinct_roles(self) -> "RepositoryConfig":
+        if self.integration_branch == self.working_branch:
+            raise ValueError("integration_branch and working_branch must differ")
         return self
 
     @property
-    def export_branch(self) -> str:
-        if self.export is not None and self.export.branch is not None:
-            return self.export.branch
-        return self.allowed_branches[0]
+    def branches(self) -> tuple[str, str]:
+        return (self.integration_branch, self.working_branch)
 
     @property
     def effective_remote_url(self) -> str:

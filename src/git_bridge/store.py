@@ -1,6 +1,13 @@
-"""Snapshot transports: where exported files and ``snapshot.json`` end up.
+"""Snapshot transports: where a refresh generation's artifacts end up.
 
-A store is an outbound copy of one Git commit, never a source of truth.
+A generation consists of two artifacts with stable names:
+
+- ``snapshot``      the complete integration-branch ZIP (``<key>-snapshot.zip``)
+- ``working_diff``  the integration -> working tree overlay (``<key>-working.diff``)
+
+A store keeps each role's current artifact plus a small metadata record
+(generation ID, commits, SHA-256, fingerprint). It is an outbound copy,
+never a source of truth.
 """
 
 from __future__ import annotations
@@ -10,29 +17,14 @@ import json
 import os
 import tempfile
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Literal
 
 from .errors import SnapshotError
 
-SNAPSHOT_NAME = "snapshot.json"
-
-
-@dataclass(frozen=True)
-class FileMetadata:
-    blob_sha: str
-    size: int
-    file_class: str
-    mime_type: str
-
-
-@dataclass(frozen=True)
-class StoredFile:
-    path: str
-    file_id: str
-    # Git blob SHA of the stored content, if known; used to skip unchanged files.
-    blob_sha: str | None
+SNAPSHOT_NAME = "snapshot.json"  # manifest inside the snapshot ZIP
+Role = Literal["snapshot", "working_diff"]
+ROLES: tuple[Role, ...] = ("snapshot", "working_diff")
 
 
 def check_relative_path(path: str) -> PurePosixPath:
@@ -54,41 +46,15 @@ def git_blob_sha1(content: bytes) -> str:
 
 
 class SnapshotStore(ABC):
-    """Outbound snapshot transport. Implementations must be idempotent."""
+    """Outbound transport for a generation's artifacts."""
 
     @abstractmethod
-    def existing_files(self) -> dict[str, StoredFile]:
-        """Files previously exported by the bridge, keyed by repository path."""
+    def put_artifact(self, role: Role, name: str, data: bytes, mime_type: str, info: dict[str, str]) -> str:
+        """Create or replace in place (same identity) the artifact of ``role``."""
 
     @abstractmethod
-    def put_file(self, path: str, content: bytes, metadata: FileMetadata) -> StoredFile:
-        """Create or update (in place) the file at ``path``."""
-
-    @abstractmethod
-    def delete_file(self, path: str) -> None:
-        """Remove a previously exported file."""
-
-    @abstractmethod
-    def put_snapshot(self, snapshot: dict[str, Any]) -> None:
-        """Write ``snapshot.json`` at the export root."""
-
-    @abstractmethod
-    def get_snapshot(self) -> dict[str, Any] | None:
-        """Current ``snapshot.json`` content, or None."""
-
-    # Archive format ------------------------------------------------------
-
-    @abstractmethod
-    def put_archive(self, name: str, data: bytes, info: dict[str, str]) -> str:
-        """Create or replace (in place, same identity) the repository archive."""
-
-    @abstractmethod
-    def get_archive_info(self) -> dict[str, str] | None:
-        """Metadata recorded with the current archive (commit, fingerprint, …)."""
-
-    @abstractmethod
-    def remove_file_exports(self) -> int:
-        """Remove per-file exports and snapshot.json; return files removed."""
+    def get_artifact_info(self, role: Role) -> dict[str, str] | None:
+        """Metadata recorded with the current artifact of ``role`` (incl. ``name``)."""
 
 
 def _atomic_write(target: Path, data: bytes) -> None:
@@ -103,79 +69,28 @@ def _atomic_write(target: Path, data: bytes) -> None:
         raise
 
 
-ARCHIVE_INFO_NAME = ".gb-archive.json"
-
-
 class LocalDirectorySnapshotStore(SnapshotStore):
-    """Exports into a local directory. For development, tests, or a folder
-    synchronised by another tool."""
+    """Writes artifacts into a local directory (development, tests, or a
+    folder synchronised by another tool)."""
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
 
-    def put_archive(self, name: str, data: bytes, info: dict[str, str]) -> str:
-        previous = self.get_archive_info()
+    def _info_path(self, role: Role) -> Path:
+        return self.root / f".gb-{role}.json"
+
+    def put_artifact(self, role: Role, name: str, data: bytes, mime_type: str, info: dict[str, str]) -> str:
+        if "/" in name or "\\" in name or name.startswith("."):
+            raise SnapshotError(f"invalid artifact name {name!r}")
+        previous = self.get_artifact_info(role)
         _atomic_write(self.root / name, data)
-        _atomic_write(self.root / ARCHIVE_INFO_NAME, json.dumps({**info, "name": name}).encode("utf-8"))
+        _atomic_write(self._info_path(role), json.dumps({**info, "name": name}).encode("utf-8"))
         if previous and previous.get("name") not in (None, name):
             (self.root / previous["name"]).unlink(missing_ok=True)
         return name
 
-    def get_archive_info(self) -> dict[str, str] | None:
+    def get_artifact_info(self, role: Role) -> dict[str, str] | None:
         try:
-            return json.loads((self.root / ARCHIVE_INFO_NAME).read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return None
-
-    def remove_file_exports(self) -> int:
-        removed = 0
-        for path in self.existing_files():
-            self.delete_file(path)
-            removed += 1
-        (self.root / SNAPSHOT_NAME).unlink(missing_ok=True)
-        return removed
-
-    def _target(self, path: str) -> Path:
-        rel = check_relative_path(path)
-        target = self.root.joinpath(*rel.parts)
-        root = self.root.resolve()
-        if not target.resolve().is_relative_to(root):
-            raise SnapshotError(f"path escapes export root: {path[:200]!r}")
-        return target
-
-    def existing_files(self) -> dict[str, StoredFile]:
-        found: dict[str, StoredFile] = {}
-        if not self.root.exists():
-            return found
-        info = self.get_archive_info() or {}
-        for file in self.root.rglob("*"):
-            if not file.is_file() or file.is_symlink():
-                continue
-            rel = file.relative_to(self.root).as_posix()
-            if rel in (SNAPSHOT_NAME, info.get("name")) or file.name.startswith(".gb-"):
-                continue
-            found[rel] = StoredFile(rel, rel, git_blob_sha1(file.read_bytes()))
-        return found
-
-    def put_file(self, path: str, content: bytes, metadata: FileMetadata) -> StoredFile:
-        _atomic_write(self._target(path), content)
-        return StoredFile(path, path, metadata.blob_sha)
-
-    def delete_file(self, path: str) -> None:
-        target = self._target(path)
-        target.unlink(missing_ok=True)
-        parent = target.parent
-        root = self.root.resolve()
-        while parent.resolve() != root and parent.exists() and not any(parent.iterdir()):
-            parent.rmdir()
-            parent = parent.parent
-
-    def put_snapshot(self, snapshot: dict[str, Any]) -> None:
-        data = json.dumps(snapshot, indent=2, sort_keys=False).encode("utf-8") + b"\n"
-        _atomic_write(self.root / SNAPSHOT_NAME, data)
-
-    def get_snapshot(self) -> dict[str, Any] | None:
-        try:
-            return json.loads((self.root / SNAPSHOT_NAME).read_text(encoding="utf-8"))
+            return json.loads(self._info_path(role).read_text(encoding="utf-8"))
         except FileNotFoundError:
             return None

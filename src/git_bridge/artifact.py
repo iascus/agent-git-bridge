@@ -1,4 +1,4 @@
-"""Parse and validate the ``publish.zip`` publication artifact.
+"""Parse and validate the push artifact (``<key>-push.zip``).
 
 The archive is read entirely in memory and never extracted to disk. Only the
 exact member names of the declared format version are accepted, so path
@@ -31,7 +31,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ALLOWED_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
 
-class PublishRequest(BaseModel):
+class PushRequest(BaseModel):
     """``request.json``, format version 1."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -93,8 +93,8 @@ class PublishRequest(BaseModel):
 
 
 @dataclass(frozen=True)
-class PublishArtifact:
-    request: PublishRequest
+class PushArtifact:
+    request: PushRequest
     patch: bytes
 
     @property
@@ -127,7 +127,7 @@ def _read_member(zf: zipfile.ZipFile, info: zipfile.ZipInfo, limit: int) -> byte
     return data
 
 
-def parse_artifact(data: bytes, limits: Limits) -> PublishArtifact:
+def parse_artifact(data: bytes, limits: Limits) -> PushArtifact:
     if len(data) > limits.max_archive_bytes:
         raise ArtifactTooLarge(f"archive exceeds {limits.max_archive_bytes} bytes")
     if not data:
@@ -184,7 +184,7 @@ def parse_artifact(data: bytes, limits: Limits) -> PublishArtifact:
         raise ArtifactError("unsupported or missing format_version", supported=sorted(MEMBERS_BY_VERSION))
 
     try:
-        request = PublishRequest.model_validate(decoded)
+        request = PushRequest.model_validate(decoded)
     except ValidationError as exc:
         problems = [
             {"field": ".".join(str(p) for p in err["loc"]), "problem": err["msg"]} for err in exc.errors()
@@ -200,4 +200,4 @@ def parse_artifact(data: bytes, limits: Limits) -> PublishArtifact:
     if not hmac.compare_digest(actual, request.patch_sha256):
         raise ChecksumMismatch("changes.patch does not match patch_sha256", actual=actual)
 
-    return PublishArtifact(request=request, patch=patch)
+    return PushArtifact(request=request, patch=patch)

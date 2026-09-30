@@ -32,12 +32,12 @@ def multi(tmp_path: Path) -> MultiEnv:
     return MultiEnv(tmp_path)
 
 
-def test_each_repository_publishes_to_its_own_remote(multi: MultiEnv):
+def test_each_repository_pushes_to_its_own_remote(multi: MultiEnv):
     r_base, r_patch = multi.rot3k.make_patch({"MANIFEST.md": "rot3k change\n"})
     c_base, c_patch = multi.cyber.make_patch({"docs/guide.md": "cyberpunk change\n"})
 
-    r_out = multi.repo(multi.rot3k).publish(multi.rot3k.artifact(r_patch, r_base))
-    c_out = multi.repo(multi.cyber).publish(multi.cyber.artifact(c_patch, c_base))
+    r_out = multi.repo(multi.rot3k).push(multi.rot3k.artifact(r_patch, r_base))
+    c_out = multi.repo(multi.cyber).push(multi.cyber.artifact(c_patch, c_base))
 
     assert r_out.ok and c_out.ok, (r_out.error, c_out.error)
     assert multi.rot3k.head() == r_out.new_sha
@@ -52,7 +52,7 @@ def test_each_repository_publishes_to_its_own_remote(multi: MultiEnv):
 def test_artifact_for_one_repository_rejected_by_another(multi: MultiEnv):
     base, patch = multi.rot3k.make_patch({"MANIFEST.md": "x\n"})
     cyber_before = multi.cyber.head()
-    outcome = multi.repo(multi.cyber).publish(multi.rot3k.artifact(patch, base))
+    outcome = multi.repo(multi.cyber).push(multi.rot3k.artifact(patch, base))
     assert outcome.error.code == "not_allowed"
     assert multi.rot3k.head() == base
     assert multi.cyber.head() == cyber_before
@@ -61,7 +61,7 @@ def test_artifact_for_one_repository_rejected_by_another(multi: MultiEnv):
 def test_repositories_do_not_share_a_lock(multi: MultiEnv):
     base, patch = multi.cyber.make_patch({"MANIFEST.md": "while rot3k is busy\n"})
     with multi.repo(multi.rot3k).lock:  # rot3k busy with a long operation
-        outcome = multi.repo(multi.cyber).publish(multi.cyber.artifact(patch, base))
+        outcome = multi.repo(multi.cyber).push(multi.cyber.artifact(patch, base))
     assert outcome.ok, outcome.error
 
 
@@ -73,7 +73,7 @@ def test_parallel_publications_to_different_repositories(multi: MultiEnv):
     results: dict[str, object] = {}
 
     def run(env: GitEnv, artifact) -> None:
-        results[env.key] = multi.repo(env).publish(artifact)
+        results[env.key] = multi.repo(env).push(artifact)
 
     threads = [threading.Thread(target=run, args=job) for job in jobs]
     for t in threads:
@@ -93,7 +93,7 @@ def test_parallel_publications_to_same_repository_are_serialised(multi: MultiEnv
     lock = threading.Lock()
 
     def run(artifact) -> None:
-        out = multi.repo(env).publish(artifact)
+        out = multi.repo(env).push(artifact)
         with lock:
             results.append(out)
 
@@ -115,7 +115,8 @@ def test_status_is_per_repository(multi: MultiEnv):
         status = multi.repo(env).status()
         assert status.key == env.key
         assert status.repository == env.github_repo
-        assert status.branches[0].remote_sha == env.head()
+        assert status.working.commit == env.head()
+        assert status.integration.commit == env.head("main")
 
 
 def test_stale_worktrees_cleaned_only_for_own_repository(multi: MultiEnv):
@@ -127,7 +128,7 @@ def test_stale_worktrees_cleaned_only_for_own_repository(multi: MultiEnv):
     for d in (own_leftover, other, cyber):
         (d / "wt").mkdir(parents=True)
     base, patch = multi.rot3k.make_patch({"a.md": "a\n"})
-    assert multi.repo(multi.rot3k).publish(multi.rot3k.artifact(patch, base)).ok
+    assert multi.repo(multi.rot3k).push(multi.rot3k.artifact(patch, base)).ok
     assert not own_leftover.exists()
     assert other.exists() and cyber.exists()
 
@@ -138,7 +139,7 @@ def test_stale_worktrees_cleaned_only_for_own_repository(multi: MultiEnv):
 def test_former_name_accepted_in_request(gitenv: GitEnv):
     gitenv.with_repo_config(github_repo="iascus/rot3k", former_github_repos=["iascus/rt3k"])
     base, patch = gitenv.make_patch({"MANIFEST.md": "renamed\n"})
-    outcome = gitenv.repo.publish(gitenv.artifact(patch, base, repository="iascus/rt3k"))
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base, repository="iascus/rt3k"))
     assert outcome.ok, outcome.error
 
 
@@ -155,7 +156,8 @@ def test_clone_follows_declared_rename(tmp_path: Path):
         github_repo="iascus/rot3k",
         former_github_repos=["iascus/rt3k"],
         local_path=local,
-        allowed_branches=[BRANCH],
+        integration_branch="main",
+        working_branch=BRANCH,
     )
     bridge = Bridge(Settings(work_dir=tmp_path / "work", repositories={"rot3k": cfg}))
     bridge.repository("rot3k").ensure_clone()
@@ -165,7 +167,9 @@ def test_clone_follows_declared_rename(tmp_path: Path):
 def test_clone_with_undeclared_old_url_is_refused(tmp_path: Path):
     local = tmp_path / "cache" / "rot3k.git"
     _bare_clone_pointing_at(local, github_url("iascus/rt3k"))
-    cfg = RepositoryConfig(github_repo="iascus/rot3k", local_path=local, allowed_branches=[BRANCH])
+    cfg = RepositoryConfig(
+        github_repo="iascus/rot3k", local_path=local, integration_branch="main", working_branch=BRANCH
+    )
     bridge = Bridge(Settings(work_dir=tmp_path / "work", repositories={"rot3k": cfg}))
     with pytest.raises(ConfigError):
         bridge.repository("rot3k").ensure_clone()
@@ -175,7 +179,13 @@ def test_clone_with_undeclared_old_url_is_refused(tmp_path: Path):
 
 
 def _repo(name: str, path: str, **extra) -> dict:
-    return {"github_repo": name, "local_path": path, "allowed_branches": ["design-docs"], **extra}
+    return {
+        "github_repo": name,
+        "local_path": path,
+        "integration_branch": "main",
+        "working_branch": "design-docs",
+        **extra,
+    }
 
 
 @pytest.mark.parametrize(
@@ -195,8 +205,8 @@ def _repo(name: str, path: str, **extra) -> dict:
         ({"a": _repo("iascus/rot3k", "/srv/work/a")}, "/srv/work"),
         # overlapping Drive export roots
         (
-            {"a": _repo("iascus/rot3k", "/srv/a", export={"drive_root": "ChatGPT"}),
-             "b": _repo("iascus/cyberpunk-tactics", "/srv/b", export={"drive_root": "ChatGPT/cyberpunk"})},
+            {"a": _repo("iascus/rot3k", "/srv/a", export={"drive_root": "ChatGPT", "manifest": "M.md"}),
+             "b": _repo("iascus/cyberpunk-tactics", "/srv/b", export={"drive_root": "ChatGPT/cyberpunk", "manifest": "M.md"})},
             "/srv/work",
         ),
     ],

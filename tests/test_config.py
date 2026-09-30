@@ -15,7 +15,7 @@ def test_example_config_is_valid():
     settings = load_settings(ROOT / "config" / "example.yaml")
     assert set(settings.repositories) == {"rot3k", "cyberpunk-tactics"}
     repo = settings.repositories["rot3k"]
-    assert repo.allowed_branches == ["design-docs"]
+    assert (repo.integration_branch, repo.working_branch) == ("main", "design-docs")
     assert repo.effective_remote_url == "https://github.com/iascus/rt3k.git"
 
 
@@ -23,7 +23,7 @@ def test_unknown_keys_rejected(tmp_path):
     cfg = tmp_path / "c.yaml"
     cfg.write_text(
         "work_dir: /tmp/w\nrepositories:\n  r:\n    github_repo: a/b\n    local_path: /tmp/r\n"
-        "    allowed_branches: [main]\n    allow_force_push: true\n"
+        "    integration_branch: main\n    working_branch: dev\n    allow_force_push: true\n"
     )
     with pytest.raises(ConfigError):
         load_settings(cfg)
@@ -40,7 +40,7 @@ def test_safe_branch_names(good):
 
 
 def test_repositories_must_not_share_local_path():
-    repo = {"github_repo": "a/b", "local_path": "/srv/x", "allowed_branches": ["main"]}
+    repo = {"github_repo": "a/b", "local_path": "/srv/x", "integration_branch": "main", "working_branch": "dev"}
     with pytest.raises(ValueError):
         Settings.model_validate({"work_dir": "/w", "repositories": {"a": repo, "b": repo}})
 

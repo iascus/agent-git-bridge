@@ -11,11 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from git_bridge.artifact import PublishArtifact, parse_artifact
+from git_bridge.artifact import PushArtifact, parse_artifact
 from git_bridge.config import Limits, RepositoryConfig, Settings, ValidationCommand
 from git_bridge.repository import Bridge, Repository
 
-BRANCH = "design-docs"
+BRANCH = "design-docs"  # working branch
+INTEGRATION = "main"
 GITHUB_REPO = "iascus/rot3k"
 
 _TEST_GIT_ENV = {
@@ -105,11 +106,24 @@ class GitEnv:
     def head(self, branch: str = BRANCH) -> str:
         return git(self.origin, "rev-parse", f"refs/heads/{branch}")
 
-    def _reset_seed(self) -> None:
+    def _reset_seed(self, branch: str = BRANCH) -> None:
         git(self.seed, "fetch", "--quiet", "origin")
-        git(self.seed, "checkout", "--quiet", "-B", BRANCH, f"origin/{BRANCH}")
-        git(self.seed, "reset", "--quiet", "--hard", f"origin/{BRANCH}")
+        git(self.seed, "checkout", "--quiet", "-B", branch, f"origin/{branch}")
+        git(self.seed, "reset", "--quiet", "--hard", f"origin/{branch}")
         git(self.seed, "clean", "-fdq")
+
+    def commit_to(self, branch: str, edits: dict[str, bytes | str | None], message: str = "change") -> str:
+        """Another writer commits ``edits`` to ``branch`` on the remote."""
+        self._reset_seed(branch)
+        self._write(edits)
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "--allow-empty", "-m", message)
+        git(self.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
+        return self.head(branch)
+
+    def set_branch(self, branch: str, commit: str) -> None:
+        """Force the remote branch to ``commit`` (simulates an external rebase)."""
+        git(self.origin, "update-ref", f"refs/heads/{branch}", commit)
 
     def _write(self, edits: dict[str, bytes | str | None]) -> None:
         for rel, content in edits.items():
@@ -140,7 +154,7 @@ class GitEnv:
         git(self.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
         return self.head()
 
-    def artifact(self, patch: bytes, base: str, **overrides) -> PublishArtifact:
+    def artifact(self, patch: bytes, base: str, **overrides) -> PushArtifact:
         overrides.setdefault("repository", self.github_repo)
         return parse_artifact(artifact_zip(patch, base, **overrides), self.limits)
 
@@ -165,7 +179,8 @@ def build_gitenv(tmp_path: Path, key: str = "rot3k", github_repo: str = GITHUB_R
         github_repo=github_repo,
         local_path=tmp_path / "cache" / f"{key}.git",
         remote_url=str(origin),
-        allowed_branches=[BRANCH],
+        integration_branch=INTEGRATION,
+        working_branch=BRANCH,
         denied_paths=[".github/**"],
         validation=[],
     )
@@ -178,4 +193,4 @@ def gitenv(tmp_path: Path) -> GitEnv:
     return build_gitenv(tmp_path)
 
 
-__all__ = ["BRANCH", "GITHUB_REPO", "GitEnv", "build_gitenv", "ValidationCommand", "artifact_zip", "git", "make_zip", "request_for"]
+__all__ = ["BRANCH", "INTEGRATION", "GITHUB_REPO", "GitEnv", "build_gitenv", "ValidationCommand", "artifact_zip", "git", "make_zip", "request_for"]

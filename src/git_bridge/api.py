@@ -4,8 +4,9 @@ Endpoints:
   GET  /health                          (unauthenticated, reveals nothing)
   GET  /repos/{repo}/status
   POST /repos/{repo}/refresh
-  POST /repos/{repo}/validate-patch     body: publish.zip (raw or multipart)
-  POST /repos/{repo}/publish            body: publish.zip (raw or multipart)
+  POST /repos/{repo}/validate-patch     body: <key>-push.zip (raw or multipart)
+  POST /repos/{repo}/push               body: <key>-push.zip (raw or multipart)
+  POST /repos/{repo}/publish            deprecated alias of /push
 """
 
 from __future__ import annotations
@@ -23,11 +24,11 @@ from .auth import Authenticator, BearerTokenAuthenticator, Principal
 from .config import Settings
 from .errors import ArtifactError, ArtifactTooLarge, BridgeError, Unauthorized
 from .repository import Bridge, Repository, default_store_factory
-from .results import ErrorInfo, PublishOutcome
+from .results import ErrorInfo, PushOutcome
 
 log = logging.getLogger("git_bridge.api")
 
-_UPLOAD_FIELD_NAMES = ("file", "zip", "artifact", "publish")
+_UPLOAD_FIELD_NAMES = ("file", "zip", "artifact", "push")
 
 
 def _error_response(exc: BridgeError, **extra) -> JSONResponse:
@@ -115,15 +116,15 @@ def create_app(
             body = await _read_body(request, limits.max_archive_bytes)
             artifact = parse_artifact(_extract_upload(request.headers.get("content-type", ""), body), limits)
         except BridgeError as exc:
-            outcome = PublishOutcome(operation=operation, error=ErrorInfo(
+            outcome = PushOutcome(operation=operation, error=ErrorInfo(
                 code=exc.code, message=exc.message, http_status=exc.http_status, details=exc.details
             ))
-            if operation == "publish":
-                outcome.git_publish = "failed"
+            if operation == "push":
+                outcome.git_push = "failed"
             bridge.events.emit(operation, repo=repository.key, ok=False, error=exc.code)
             return JSONResponse(outcome.summarise().model_dump(), status_code=exc.http_status)
-        if operation == "publish":
-            outcome = await run_in_threadpool(repository.publish_and_refresh, artifact)
+        if operation == "push":
+            outcome = await run_in_threadpool(repository.push_and_refresh, artifact)
         else:
             outcome = await run_in_threadpool(repository.validate_patch, artifact)
         code = outcome.error.http_status if outcome.error else 200
@@ -133,8 +134,13 @@ def create_app(
     async def validate_patch(request: Request, repository: Repository = Depends(get_repo)) -> JSONResponse:
         return await _patch_endpoint(request, repository, "validate")
 
+    @app.post("/repos/{repo}/push")
+    async def push(request: Request, repository: Repository = Depends(get_repo)) -> JSONResponse:
+        return await _patch_endpoint(request, repository, "push")
+
+    # Deprecated: kept so existing iOS Shortcuts keep working during migration.
     @app.post("/repos/{repo}/publish")
-    async def publish(request: Request, repository: Repository = Depends(get_repo)) -> JSONResponse:
-        return await _patch_endpoint(request, repository, "publish")
+    async def publish_deprecated(request: Request, repository: Repository = Depends(get_repo)) -> JSONResponse:
+        return await _patch_endpoint(request, repository, "push")
 
     return app

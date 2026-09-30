@@ -1,443 +1,278 @@
+"""Generation building: integration snapshot + integration -> working overlay.
+
+The central invariant: unzip(snapshot) + git apply(overlay) == sel(D),
+byte for byte, whatever the branches' histories look like.
+"""
+
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
+import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
 
-from conftest import BRANCH, GitEnv, git
+from conftest import BRANCH, INTEGRATION, GitEnv, git
 from git_bridge.config import ExportConfig
 from git_bridge.errors import SnapshotError
-from git_bridge.snapshot import build_snapshot, classify, mime_type_for
-from git_bridge.store import FileMetadata, LocalDirectorySnapshotStore, SnapshotStore, git_blob_sha1
+from git_bridge.manifest import parse_manifest
+from git_bridge.snapshot import build_generation
+from git_bridge.store import git_blob_sha1
 
-EXPORT = ExportConfig(
-    drive_root="ChatGPT/rot3k",
-    format="files",
-    bootstrap=["MANIFEST.md", "docs/**/*.md"],
-    indexes=["characters/index*.json"],
-    lazy=["characters/**/*.md", "records/**/*.md", "assets/**"],
-    exclude=["records/private-*"],
-)
+MANIFEST_PATH = "docs/design/MANIFEST.md"
+EXPORT = ExportConfig(drive_root="ChatGPT/rot3k", manifest=MANIFEST_PATH)
 
 
-class RecordingStore(SnapshotStore):
-    """Wraps a real store and records the order of operations."""
-
-    def __init__(self, inner: SnapshotStore, hooks: dict | None = None) -> None:
-        self.inner = inner
-        self.ops: list[tuple[str, str]] = []
-        self.hooks = hooks or {}
-
-    def existing_files(self):
-        return self.inner.existing_files()
-
-    def put_file(self, path, content, metadata):
-        if "put_file" in self.hooks:
-            self.hooks["put_file"](path)
-        self.ops.append(("put_file", path))
-        return self.inner.put_file(path, content, metadata)
-
-    def delete_file(self, path):
-        self.ops.append(("delete_file", path))
-        self.inner.delete_file(path)
-
-    def put_snapshot(self, snapshot):
-        self.ops.append(("put_snapshot", snapshot["state"]))
-        self.inner.put_snapshot(snapshot)
-
-    def get_snapshot(self):
-        return self.inner.get_snapshot()
-
-    def put_archive(self, name, data, info):
-        self.ops.append(("put_archive", name))
-        return self.inner.put_archive(name, data, info)
-
-    def get_archive_info(self):
-        return self.inner.get_archive_info()
-
-    def remove_file_exports(self):
-        self.ops.append(("remove_file_exports", ""))
-        return self.inner.remove_file_exports()
-
-
-class FailingStore(RecordingStore):
-    def put_file(self, path, content, metadata):
-        raise ConnectionError("Drive unavailable")
-
-
-def _seed_repo(env: GitEnv) -> str:
-    """Add a representative tree to the remote and return the new head."""
-    env._reset_seed()
-    env._write(
-        {
-            "docs/rules.md": "Rules\n",
-            "characters/index.json": '{"a": 1}\n',
-            "characters/alice.md": "Alice\n",
-            "records/juan-23.md": "Juan\n",
-            "records/private-notes.md": "secret\n",
-            "src/unmatched.py": "print()\n",
-            "assets/image.bin": bytes(range(256)),
-            "snapshot.json": "{}\n",  # collides with the manifest name
-        }
+def manifest_md(*paths: str) -> str:
+    listed = "\n".join(f"  - {p}" for p in (MANIFEST_PATH, *paths))
+    return (
+        "# Manifest\n\nProse mentioning docs/ignored.md is not part of the inventory.\n\n"
+        "<!-- PROJECT_SOURCE_FILES_BEGIN -->\n```yaml\nproject_source_files:\n"
+        f"{listed}\n```\n<!-- PROJECT_SOURCE_FILES_END -->\n"
     )
-    git(env.seed, "add", "-A")
-    git(env.seed, "commit", "--quiet", "-m", "Seed tree")
-    git(env.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
-    return env.head()
+
+
+BASE_FILES = {
+    "AGENTS.md": "Agents\n",
+    "docs/design/RULES.md": "Rule one.\nRule two.\nRule three.\n",
+    "docs/design/LORE.md": "Once upon a time.\n" * 20,
+    "docs/characters/liu-bei.md": "Liu Bei\n",
+    "src/app.py": "print('not in the manifest')\n",
+}
+BASE_LISTED = ["AGENTS.md", "docs/design/RULES.md", "docs/design/LORE.md", "docs/characters/liu-bei.md"]
 
 
 @pytest.fixture
-def snapenv(gitenv: GitEnv) -> GitEnv:
+def proj(gitenv: GitEnv) -> GitEnv:
+    """main and design-docs both at a commit with a manifest and files."""
+    base = gitenv.commit_to(INTEGRATION, {MANIFEST_PATH: manifest_md(*BASE_LISTED), **BASE_FILES}, "project base")
+    gitenv.set_branch(BRANCH, base)
     gitenv.with_repo_config(export=EXPORT)
-    _seed_repo(gitenv)
-    export_root = gitenv.tmp / "export"
-    gitenv.export_root = export_root
-    gitenv.store_factory = lambda repo: LocalDirectorySnapshotStore(export_root)
     return gitenv
 
 
-def _exported(env: GitEnv) -> dict[str, bytes]:
-    root: Path = env.export_root
-    return {
-        p.relative_to(root).as_posix(): p.read_bytes()
-        for p in root.rglob("*")
-        if p.is_file() and p.name != "snapshot.json"
-    }
-
-
-def _manifest(env: GitEnv) -> dict:
-    return json.loads((env.export_root / "snapshot.json").read_text())
-
-
-# ------------------------------------------------------------ classification
-
-
-@pytest.mark.parametrize(
-    "path,expected",
-    [
-        ("MANIFEST.md", "bootstrap"),
-        ("docs/a/b.md", "bootstrap"),
-        ("characters/index.json", "index"),
-        ("characters/alice.md", "lazy"),
-        ("records/private-x.md", None),
-        ("src/app.py", None),
-    ],
-)
-def test_classify(path, expected):
-    assert classify(path, EXPORT) == expected
-
-
-def test_mime_types():
-    assert mime_type_for("a/b.md") == "text/markdown"
-    assert mime_type_for("x.json") == "application/json"
-    assert mime_type_for("Makefile") == "text/plain"
-
-
-# ----------------------------------------------------------------- building
-
-
-def test_snapshot_lists_exact_commit_with_correct_blob_shas(snapenv: GitEnv):
-    head = snapenv.head()
-    repo = snapenv.repo
+def generate(env: GitEnv):
+    repo = env.repo
     repo.ensure_clone()
-    repo.fetch(BRANCH)
-    build = build_snapshot(
-        repo.git, commit=head, repository="iascus/rot3k", repository_key="rot3k", branch=BRANCH, export=EXPORT
+    m, d = repo.fetch_heads()
+    return build_generation(
+        repo.git,
+        integration_commit=m,
+        working_commit=d,
+        repository=env.github_repo,
+        project_key=env.key,
+        integration_branch=INTEGRATION,
+        working_branch=BRANCH,
+        export=EXPORT,
+        snapshot_name="rot3k-snapshot.zip",
+        diff_name="rot3k-working.diff",
     )
-    m = build.manifest
-    assert m["commit"] == head and m["format_version"] == 1
-    assert m["tree"] == git(snapenv.origin, "rev-parse", f"{head}^{{tree}}")
-    assert set(m["files"]) == {
-        "MANIFEST.md", "docs/guide.md", "docs/rules.md", "characters/index.json",
-        "characters/alice.md", "records/juan-23.md", "assets/image.bin",
-    }
-    for path, info in m["files"].items():
-        assert info["blob_sha"] == git(snapenv.origin, "rev-parse", f"{head}:{path}")
-        assert info["size"] == int(git(snapenv.origin, "cat-file", "-s", info["blob_sha"]))
-        if info["exported"]:
-            content = build.contents[path]
-            assert git_blob_sha1(content) == info["blob_sha"]
-            assert hashlib.sha1(b"blob %d\0" % len(content) + content).hexdigest() == info["blob_sha"]
-    assert m["files"]["assets/image.bin"] == {**m["files"]["assets/image.bin"], "exported": False, "reason": "binary"}
-    assert m["files"]["characters/index.json"]["class"] == "index"
-    assert m["counts"] == {"listed": 7, "exported": 6, "bootstrap": 3, "index": 1, "lazy": 2, "missing": 0}
 
 
-def test_oversized_and_symlinked_files_listed_but_not_exported(snapenv: GitEnv):
-    snapenv._reset_seed()
-    blob = git(snapenv.seed, "hash-object", "-w", "--stdin", input=b"docs/rules.md")
-    git(snapenv.seed, "update-index", "--add", "--cacheinfo", f"120000,{blob},docs/link.md")
-    (snapenv.seed / "docs" / "big.md").write_bytes(b"x" * 5000)
-    git(snapenv.seed, "add", "docs/big.md")
-    git(snapenv.seed, "commit", "--quiet", "-m", "link and big file")
-    git(snapenv.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
-    snapenv.with_repo_config(export=EXPORT.model_copy(update={"max_file_bytes": 1000}))
-    out = snapenv.repo.refresh()
-    assert out.ok, out.error
-    files = _manifest(snapenv)["files"]
-    assert files["docs/link.md"]["reason"] == "symlink"
-    assert files["docs/big.md"]["reason"] == "too_large"
-    assert "docs/link.md" not in _exported(snapenv)
+def unzip(data: bytes) -> tuple[dict, dict[str, bytes]]:
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        contents = {i.filename: zf.read(i) for i in zf.infolist()}
+    return json.loads(contents.pop("snapshot.json")), contents
 
 
-def test_repository_file_named_like_manifest_is_not_exported(snapenv: GitEnv):
-    snapenv.with_repo_config(export=EXPORT.model_copy(update={"bootstrap": ["*.json", "MANIFEST.md"]}))
-    out = snapenv.repo.refresh()
-    assert out.ok, out.error
-    m = _manifest(snapenv)
-    assert m["files"]["snapshot.json"]["reason"] == "unsupported_path"
-    assert m["state"] == "complete"  # the real manifest was not overwritten by the repo file
-
-
-def test_total_size_limit(snapenv: GitEnv):
-    snapenv.with_repo_config(export=EXPORT.model_copy(update={"max_total_bytes": 10}))
-    out = snapenv.repo.refresh()
-    assert not out.ok and out.error.code == "snapshot_failed"
-
-
-# ------------------------------------------------------------------ export
-
-
-def test_refresh_exports_files_and_manifest(snapenv: GitEnv):
-    out = snapenv.repo.refresh()
-    assert out.ok, out.error
-    assert out.commit == snapenv.head()
-    assert (out.exported, out.uploaded, out.unchanged, out.deleted) == (6, 6, 0, 0)
-    exported = _exported(snapenv)
-    assert exported["records/juan-23.md"] == b"Juan\n"
-    assert "records/private-notes.md" not in exported and "src/unmatched.py" not in exported
-    m = _manifest(snapenv)
-    assert m["state"] == "complete" and m["commit"] == out.commit and m["generation_id"] == out.generation_id
-    assert m["generated_at"].endswith("Z")
-    for path, content in exported.items():
-        assert git_blob_sha1(content) == m["files"][path]["blob_sha"]
-    assert "Juan" not in json.dumps(m)  # manifest never contains file contents
-
-
-def test_second_refresh_updates_only_changes(snapenv: GitEnv):
-    first = snapenv.repo.refresh()
-    snapenv._reset_seed()
-    snapenv._write({"records/juan-23.md": "Juan v2\n", "characters/alice.md": None, "records/new.md": "New\n"})
-    git(snapenv.seed, "add", "-A")
-    git(snapenv.seed, "commit", "--quiet", "-m", "edit")
-    git(snapenv.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
-    second = snapenv.repo.refresh()
-    assert second.ok
-    assert (second.uploaded, second.deleted, second.unchanged) == (2, 1, 4)
-    assert second.previous_commit == first.commit
-    exported = _exported(snapenv)
-    assert exported["records/juan-23.md"] == b"Juan v2\n"
-    assert "characters/alice.md" not in exported
-    assert not (snapenv.export_root / "characters" / "alice.md").exists()
-
-
-def test_manifest_written_after_files(snapenv: GitEnv):
-    recording = RecordingStore(LocalDirectorySnapshotStore(snapenv.export_root))
-    snapenv.store_factory = lambda repo: recording
-    assert snapenv.repo.refresh().ok
-    ops = recording.ops
-    assert ops[0] == ("put_snapshot", "updating")
-    assert ops[-1] == ("put_snapshot", "complete")
-    assert all(op[0] in ("put_file", "delete_file") for op in ops[1:-1])
-    assert len(ops) == 2 + 6
-
-
-def test_no_commit_mixing_when_remote_moves_during_export(snapenv: GitEnv):
-    target = snapenv.head()
-    moved = {}
-
-    def push_newer_commit(path):
-        if not moved:
-            moved["sha"] = snapenv.advance_remote("records/juan-23.md", "changed mid-export\n")
-
-    recording = RecordingStore(LocalDirectorySnapshotStore(snapenv.export_root), hooks={"put_file": push_newer_commit})
-    snapenv.store_factory = lambda repo: recording
-    out = snapenv.repo.refresh()
-    assert out.ok and out.commit == target != moved["sha"]
-    m = _manifest(snapenv)
-    assert m["commit"] == target
-    for path, content in _exported(snapenv).items():
-        # Every exported byte is the blob recorded for the target commit.
-        assert git_blob_sha1(content) == m["files"][path]["blob_sha"]
-        assert m["files"][path]["blob_sha"] == git(snapenv.origin, "rev-parse", f"{target}:{path}")
-    assert _exported(snapenv)["records/juan-23.md"] == b"Juan\n"
-    assert "concurrent.md" not in _exported(snapenv)
-
-
-def test_failed_export_leaves_manifest_marked_updating_and_retry_completes(snapenv: GitEnv):
-    assert snapenv.repo.refresh().ok
-    before = _manifest(snapenv)
-    snapenv.advance_remote("records/juan-23.md", "v2\n")
-    failing = FailingStore(LocalDirectorySnapshotStore(snapenv.export_root))
-    snapenv.store_factory = lambda repo: failing
-    out = snapenv.repo.refresh()
-    assert not out.ok and out.error.code == "snapshot_failed"
-    assert "Drive unavailable" in out.error.message
-    marker = _manifest(snapenv)
-    assert marker["state"] == "updating"
-    assert marker["previous_commit"] == before["commit"]
-    assert marker["target_commit"] == snapenv.head()
-    assert "files" not in marker  # an in-flux snapshot claims no file list
-
-    snapenv.store_factory = lambda repo: LocalDirectorySnapshotStore(snapenv.export_root)
-    retry = snapenv.repo.refresh()
-    assert retry.ok and _manifest(snapenv)["state"] == "complete"
-    assert retry.previous_commit == before["commit"]
-
-
-def test_refresh_of_commit_not_on_branch_rejected(snapenv: GitEnv):
-    out = snapenv.repo.refresh(commit="f" * 40)
-    assert not out.ok
-
-
-def test_refresh_without_export_config(gitenv: GitEnv, tmp_path):
-    gitenv.store_factory = lambda repo: LocalDirectorySnapshotStore(tmp_path / "x")
-    out = gitenv.repo.refresh()
-    assert out.error.code == "snapshot_not_configured"
-
-
-def test_local_store_refuses_traversal(tmp_path):
-    store = LocalDirectorySnapshotStore(tmp_path / "root")
-    meta = FileMetadata("0" * 40, 1, "lazy", "text/plain")
-    for bad in ("../x.md", "/abs.md", "a/../../x.md", "snapshot.json", "a\\b.md", ""):
-        with pytest.raises(SnapshotError):
-            store.put_file(bad, b"x", meta)
-    assert not (tmp_path / "x.md").exists()
-
-
-# ---------------------------------------------------- publish + snapshot
-
-
-def test_snapshot_refreshed_after_publication(snapenv: GitEnv):
-    assert snapenv.repo.refresh().ok
-    base, patch = snapenv.make_patch({"records/juan-23.md": "Juan published\n"})
-    out = snapenv.repo.publish_and_refresh(snapenv.artifact(patch, base))
-    assert out.ok and out.git_publish == "success"
-    assert out.snapshot_refresh == "success" and out.snapshot_commit == out.new_sha
-    assert _manifest(snapenv)["commit"] == out.new_sha
-    assert _exported(snapenv)["records/juan-23.md"] == b"Juan published\n"
-    assert "Drive snapshot updated" in out.message
-
-
-def test_snapshot_failure_after_publication_keeps_git_success(snapenv: GitEnv):
-    snapenv.store_factory = lambda repo: FailingStore(LocalDirectorySnapshotStore(snapenv.export_root))
-    base, patch = snapenv.make_patch({"records/juan-23.md": "Juan published\n"})
-    out = snapenv.repo.publish_and_refresh(snapenv.artifact(patch, base))
-    assert out.ok and out.git_publish == "success"
-    assert out.new_sha == snapenv.head()
-    assert out.snapshot_refresh == "failed"
-    assert "Drive unavailable" in out.snapshot_error
-    assert out.error is None
-    assert "FAILED" in out.message
-
-
-def test_snapshot_store_that_cannot_open_keeps_git_success(snapenv: GitEnv):
-    def broken(repo):
-        raise RuntimeError("no credentials")
-
-    snapenv.store_factory = broken
-    base, patch = snapenv.make_patch({"a.md": "a\n"})
-    out = snapenv.repo.publish_and_refresh(snapenv.artifact(patch, base))
-    assert out.git_publish == "success" and out.snapshot_refresh == "failed"
-    assert "no credentials" in out.snapshot_error
-
-
-def test_status_reports_snapshot(snapenv: GitEnv):
-    snapenv.repo.refresh()
-    status = snapenv.repo.status()
-    assert status.snapshot.state == "complete"
-    assert status.snapshot.commit == snapenv.head()
-    assert status.snapshot.file_count == 6
-
-
-# ------------------------------------------------------ manifest selection
-
-from git_bridge.manifest import parse_manifest  # noqa: E402
-
-MANIFEST_MD = """# Source Manifest
-
-Prose that mentions docs/rules.md is ignored.
-
-<!-- PROJECT_SOURCE_MATERIALIZATION_BEGIN -->
-```yaml
-project_source_materialization:
-  default: bootstrap
-  lazy:
-    dossiers:
-      globs:
-        - characters/*.md
-    records:
-      paths:
-        - records/juan-23.md
-```
-<!-- PROJECT_SOURCE_MATERIALIZATION_END -->
-
-<!-- PROJECT_SOURCE_FILES_BEGIN -->
-```yaml
-project_source_files:
-  - docs/design/MANIFEST.md
-  - MANIFEST.md
-  - characters/alice.md
-  - records/juan-23.md
-  - records/private-notes.md
-  - docs/gone.md
-```
-<!-- PROJECT_SOURCE_FILES_END -->
-"""
-
-
-def _commit(env: GitEnv, edits: dict) -> str:
-    env._reset_seed()
-    env._write(edits)
-    git(env.seed, "add", "-A")
-    git(env.seed, "commit", "--quiet", "-m", "manifest change")
-    git(env.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
-    return env.head()
-
-
-@pytest.fixture
-def manifestenv(snapenv: GitEnv) -> GitEnv:
-    snapenv.with_repo_config(
-        export=ExportConfig(
-            drive_root="ChatGPT/rot3k", format="files", manifest="docs/design/MANIFEST.md", exclude=["records/private-*"]
+def reconstruct(tmp: Path, snapshot_zip: bytes, overlay: bytes) -> dict[str, bytes]:
+    """What a reader does: unzip the snapshot, then `git apply` the overlay."""
+    manifest, files = unzip(snapshot_zip)
+    work = tmp / "reconstructed"
+    for rel, data in files.items():
+        (work / rel).parent.mkdir(parents=True, exist_ok=True)
+        (work / rel).write_bytes(data)
+    work.mkdir(exist_ok=True)
+    if not manifest["working_diff"]["empty"]:
+        env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+        proc = subprocess.run(
+            ["git", "-c", "core.autocrlf=false", "apply", "--whitespace=nowarn", "-"],
+            cwd=work, input=overlay, capture_output=True, env=env,
         )
+        assert proc.returncode == 0, proc.stderr.decode()
+    return {p.relative_to(work).as_posix(): p.read_bytes() for p in work.rglob("*") if p.is_file()}
+
+
+def selected_tree(env: GitEnv, commit: str) -> dict[str, bytes]:
+    """sel(commit): the files commit's own manifest lists, straight from Git."""
+    listed = parse_manifest(git_show(env, commit, MANIFEST_PATH), MANIFEST_PATH)
+    out = {}
+    for path in listed:
+        if path == "snapshot.json":  # reserved for the manifest inside the ZIP
+            continue
+        data = git_show(env, commit, path, missing_ok=True)
+        if data is not None and b"\0" not in data:
+            out[path] = data
+    return out
+
+
+def git_show(env: GitEnv, commit: str, path: str, missing_ok: bool = False) -> bytes | None:
+    proc = subprocess.run(["git", "cat-file", "blob", f"{commit}:{path}"], cwd=env.origin, capture_output=True)
+    if proc.returncode != 0:
+        assert missing_ok, proc.stderr
+        return None
+    return proc.stdout
+
+
+def assert_reconstructs(env: GitEnv, tmp: Path):
+    gen = generate(env)
+    rebuilt = reconstruct(tmp, gen.snapshot_zip, gen.diff_bytes)
+    expected = selected_tree(env, env.head(BRANCH))
+    assert rebuilt == expected  # byte-for-byte, same path set
+    # snapshot.json's working_files describe exactly the reconstructed tree
+    assert gen.manifest["working_diff"]["working_files"] == {p: git_blob_sha1(b) for p, b in expected.items()}
+    return gen
+
+
+# ------------------------------------------------------------ the snapshot
+
+
+def test_snapshot_is_the_integration_branch(proj: GitEnv):
+    proj.commit_to(BRANCH, {"AGENTS.md": "working only\n"})
+    gen = generate(proj)
+    m, files = unzip(gen.snapshot_zip)
+    assert m["format_version"] == 2
+    assert (m["integration_branch"], m["integration_commit"]) == (INTEGRATION, proj.head(INTEGRATION))
+    assert (m["working_branch"], m["working_commit"]) == (BRANCH, proj.head(BRANCH))
+    assert m["repository"] == "iascus/rot3k" and m["project_key"] == "rot3k"
+    assert files["AGENTS.md"] == b"Agents\n"  # main's content, not the working branch's
+    assert set(files) == {MANIFEST_PATH, *BASE_LISTED}
+    assert "src/app.py" not in files
+    for path, info in m["files"].items():
+        assert info["blob_sha"] == git_blob_sha1(files[path])
+        assert info["blob_sha"] == git(proj.origin, "rev-parse", f"{m['integration_commit']}:{path}")
+
+
+def test_overlay_metadata_pins_the_diff(proj: GitEnv):
+    proj.commit_to(BRANCH, {"AGENTS.md": "changed\n"})
+    gen = generate(proj)
+    wd = gen.manifest["working_diff"]
+    assert wd["sha256"] == hashlib.sha256(gen.diff_bytes).hexdigest()
+    assert wd["bytes"] == len(gen.diff_bytes)
+    assert (wd["base_commit"], wd["target_commit"]) == (proj.head(INTEGRATION), proj.head(BRANCH))
+    assert (wd["files_changed"], wd["insertions"], wd["deletions"]) == (1, 1, 1)
+    header = gen.diff_bytes.split(b"\n\n", 1)[0].decode()
+    assert f"# generation: {gen.generation_id}" in header
+    assert f"# base: main {proj.head(INTEGRATION)}" in header
+    assert f"# target: design-docs {proj.head(BRANCH)}" in header
+
+
+# ------------------------------------------------------- reconstruction
+
+
+def test_modified_new_and_deleted_files(proj: GitEnv, tmp_path):
+    listed = [p for p in BASE_LISTED if p != "docs/characters/liu-bei.md"] + ["docs/design/NEW.md"]
+    proj.commit_to(
+        BRANCH,
+        {
+            MANIFEST_PATH: manifest_md(*listed),
+            "docs/design/RULES.md": "Rule one.\nRule two, amended.\nRule three.\n",
+            "docs/design/NEW.md": "Brand new\n",
+            "docs/characters/liu-bei.md": None,
+        },
     )
-    _commit(snapenv, {"docs/design/MANIFEST.md": MANIFEST_MD})
-    return snapenv
+    gen = assert_reconstructs(proj, tmp_path)
+    body = gen.diff_bytes.decode()
+    assert "new file mode" in body and "deleted file mode" in body
+    assert not gen.manifest["working_diff"]["empty"]
 
 
-def test_manifest_defines_exactly_the_exported_set(manifestenv: GitEnv):
-    out = manifestenv.repo.refresh()
-    assert out.ok, out.error
-    m = _manifest(manifestenv)
-    assert set(_exported(manifestenv)) == {"docs/design/MANIFEST.md", "MANIFEST.md", "characters/alice.md", "records/juan-23.md"}
-    files = m["files"]
-    assert files["docs/gone.md"] == {"blob_sha": None, "size": 0, "class": "bootstrap", "exported": False, "reason": "missing"}
-    assert "records/private-notes.md" not in files  # excluded by configuration
-    assert "docs/rules.md" not in files and "src/unmatched.py" not in files  # not in the manifest
-    assert (files["characters/alice.md"]["class"], files["characters/alice.md"]["lazy_class"]) == ("lazy", "dossiers")
-    assert files["records/juan-23.md"]["lazy_class"] == "records"
-    assert files["MANIFEST.md"]["class"] == "bootstrap" and "lazy_class" not in files["MANIFEST.md"]
-    assert m["selection"]["source"] == "manifest"
-    assert m["selection"]["manifest_blob_sha"] == git(manifestenv.origin, "rev-parse", f"{out.commit}:docs/design/MANIFEST.md")
-    assert m["counts"]["missing"] == 1
+def test_rename_is_represented_and_reconstructs(proj: GitEnv, tmp_path):
+    listed = [p if p != "docs/design/LORE.md" else "docs/design/HISTORY.md" for p in BASE_LISTED]
+    proj.commit_to(
+        BRANCH,
+        {MANIFEST_PATH: manifest_md(*listed), "docs/design/LORE.md": None, "docs/design/HISTORY.md": BASE_FILES["docs/design/LORE.md"]},
+    )
+    gen = assert_reconstructs(proj, tmp_path)
+    body = gen.diff_bytes.decode()
+    assert "rename from docs/design/LORE.md" in body and "rename to docs/design/HISTORY.md" in body
 
 
-def test_manifest_change_updates_selection_and_removes_dropped_files(manifestenv: GitEnv):
-    assert manifestenv.repo.refresh().ok
-    _commit(manifestenv, {"docs/design/MANIFEST.md": MANIFEST_MD.replace("  - characters/alice.md\n", "  - docs/rules.md\n")})
-    out = manifestenv.repo.refresh()
-    assert out.ok and out.deleted == 1
-    exported = _exported(manifestenv)
-    assert "characters/alice.md" not in exported and exported["docs/rules.md"] == b"Rules\n"
+def test_identical_trees_give_an_empty_overlay(proj: GitEnv, tmp_path):
+    gen = assert_reconstructs(proj, tmp_path)
+    wd = gen.manifest["working_diff"]
+    assert wd["empty"] and wd["files_changed"] == 0
+    assert gen.diff_bytes.split(b"\n\n", 1)[1] == b""  # only the header
+    assert b"# empty:" in gen.diff_bytes
 
 
-def test_manifest_without_materialization_is_all_bootstrap():
-    sel = parse_manifest(b"<!-- PROJECT_SOURCE_FILES_BEGIN -->\nproject_source_files: [a.md, b/c.md]\n<!-- PROJECT_SOURCE_FILES_END -->", "M.md")
-    assert sel.files == ["a.md", "b/c.md"]
-    assert sel.classify("b/c.md") == ("bootstrap", None)
+def test_different_commits_with_identical_selected_trees_give_empty_overlay(proj: GitEnv, tmp_path):
+    proj.commit_to(BRANCH, {"src/app.py": "print('changed outside the manifest')\n"})
+    assert proj.head(BRANCH) != proj.head(INTEGRATION)
+    gen = assert_reconstructs(proj, tmp_path)
+    assert gen.manifest["working_diff"]["empty"]
+    assert gen.manifest["working_ahead_by"] == 1
+
+
+def test_integration_ahead_of_working_is_represented_faithfully(proj: GitEnv, tmp_path):
+    """main advanced, design-docs not rebased: the overlay 'reverts' main-only changes."""
+    proj.commit_to(INTEGRATION, {"docs/design/RULES.md": "Rule one.\nRule two.\nRule three.\nRule four (main only).\n"})
+    gen = assert_reconstructs(proj, tmp_path)
+    assert (gen.manifest["working_ahead_by"], gen.manifest["working_behind_by"]) == (0, 1)
+    assert gen.manifest["merge_base_commit"] == proj.head(BRANCH)
+    assert "-Rule four (main only)." in gen.diff_bytes.decode()
+
+
+def test_divergent_branches(proj: GitEnv, tmp_path):
+    base = proj.head(INTEGRATION)
+    proj.commit_to(INTEGRATION, {"AGENTS.md": "Agents (main)\n", "docs/design/RULES.md": "main rules\n"})
+    proj.commit_to(BRANCH, {"docs/characters/liu-bei.md": "Liu Bei (working)\n"})
+    gen = assert_reconstructs(proj, tmp_path)
+    m = gen.manifest
+    assert m["merge_base_commit"] == base
+    assert (m["working_ahead_by"], m["working_behind_by"]) == (1, 1)
+
+
+def test_file_added_to_working_manifest_only(proj: GitEnv, tmp_path):
+    """Unchanged between the trees, but only D's manifest lists it: the overlay adds it."""
+    proj.commit_to(INTEGRATION, {"docs/design/EXTRA.md": "present on both branches\n"})
+    proj.set_branch(BRANCH, proj.head(INTEGRATION))
+    proj.commit_to(BRANCH, {MANIFEST_PATH: manifest_md(*BASE_LISTED, "docs/design/EXTRA.md")})
+    gen = assert_reconstructs(proj, tmp_path)
+    assert "docs/design/EXTRA.md" not in unzip(gen.snapshot_zip)[1]
+    assert "new file mode" in gen.diff_bytes.decode()
+
+
+def test_missing_and_binary_listed_files_are_excluded_on_both_sides(proj: GitEnv, tmp_path):
+    listed = [*BASE_LISTED, "docs/missing.md", "docs/logo.bin"]
+    proj.commit_to(INTEGRATION, {MANIFEST_PATH: manifest_md(*listed), "docs/logo.bin": bytes(range(256))})
+    proj.set_branch(BRANCH, proj.head(INTEGRATION))
+    proj.commit_to(BRANCH, {"docs/logo.bin": bytes(range(255, -1, -1))})
+    gen = assert_reconstructs(proj, tmp_path)
+    assert gen.manifest["not_exported"] == {"docs/logo.bin": "binary", "docs/missing.md": "missing"}
+    assert gen.manifest["working_diff"]["empty"]  # binary change is invisible to the text export
+
+
+def test_unicode_paths_and_missing_trailing_newline(proj: GitEnv, tmp_path):
+    listed = [*BASE_LISTED, "docs/人物/曹操.md"]
+    proj.commit_to(BRANCH, {MANIFEST_PATH: manifest_md(*listed), "docs/人物/曹操.md": "曹操 without newline", "AGENTS.md": "no newline"})
+    assert_reconstructs(proj, tmp_path)
+
+
+def test_overlay_is_deterministic(proj: GitEnv):
+    proj.commit_to(BRANCH, {"AGENTS.md": "changed\n"})
+    first, second = generate(proj), generate(proj)
+    assert first.diff_bytes.split(b"\n\n", 1)[1] == second.diff_bytes.split(b"\n\n", 1)[1]
+    assert first.fingerprint == second.fingerprint
+    assert first.generation_id != second.generation_id
+
+
+def test_repository_file_named_snapshot_json_is_not_exported(proj: GitEnv, tmp_path):
+    proj.commit_to(INTEGRATION, {MANIFEST_PATH: manifest_md(*BASE_LISTED, "snapshot.json"), "snapshot.json": "{}\n"})
+    proj.set_branch(BRANCH, proj.head(INTEGRATION))
+    gen = assert_reconstructs(proj, tmp_path)
+    assert gen.manifest["not_exported"]["snapshot.json"] == "unsupported_path"
+    assert unzip(gen.snapshot_zip)[0]["format_version"] == 2  # the real manifest
+
+
+def test_missing_manifest_fails(proj: GitEnv):
+    proj.commit_to(BRANCH, {MANIFEST_PATH: None})
+    with pytest.raises(SnapshotError, match="does not exist"):
+        generate(proj)
 
 
 @pytest.mark.parametrize(
@@ -453,23 +288,3 @@ def test_manifest_without_materialization_is_all_bootstrap():
 def test_malformed_manifest_rejected(manifest, problem):
     with pytest.raises(SnapshotError, match=problem):
         parse_manifest(manifest.encode(), "M.md")
-
-
-def test_path_in_two_lazy_classes_fails_the_refresh(manifestenv: GitEnv):
-    overlapping = MANIFEST_MD.replace("        - records/juan-23.md\n", "        - characters/alice.md\n")
-    _commit(manifestenv, {"docs/design/MANIFEST.md": overlapping})
-    out = manifestenv.repo.refresh()
-    assert not out.ok and "several lazy classes" in out.error.message
-
-
-def test_missing_manifest_file_fails_the_refresh(snapenv: GitEnv):
-    snapenv.with_repo_config(export=ExportConfig(drive_root="x", manifest="docs/design/MANIFEST.md"))
-    out = snapenv.repo.refresh()
-    assert not out.ok and "does not exist" in out.error.message
-
-
-def test_manifest_and_rules_are_mutually_exclusive():
-    with pytest.raises(ValueError):
-        ExportConfig(drive_root="x", manifest="M.md", bootstrap=["*.md"])
-    with pytest.raises(ValueError):
-        ExportConfig(drive_root="x", manifest="../M.md")

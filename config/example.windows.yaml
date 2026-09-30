@@ -31,22 +31,23 @@ repositories:
   rot3k:
     github_repo: iascus/rt3k          # rename later: iascus/rot3k + former_github_repos: [iascus/rt3k]
     local_path: C:/Users/YOU/AppData/Local/agent-git-bridge/repos/rot3k.git
-    allowed_branches: [design-docs]
+    integration_branch: main          # complete snapshot (read only)
+    working_branch: design-docs       # overlay; the only branch pushes advance
     denied_paths: [.github/**]
     export:
       drive_root: ChatGPT/rot3k
       manifest: docs/design/MANIFEST.md   # the repo's own source inventory
-    # After each successful push, open a PR from the branch into base
-    # unless one is already open. Needs 'Pull requests: Read and write'.
+    # After each push, open a PR working -> integration unless one is open.
     pull_request:
-      base: main
       draft: false
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
     local_path: C:/Users/YOU/AppData/Local/agent-git-bridge/repos/cyberpunk-tactics.git
-    allowed_branches: [design-docs]
+    integration_branch: main
+    working_branch: design-docs
     denied_paths: [.github/**]
     export:
       drive_root: ChatGPT/cyberpunk-tactics
-      manifest: docs/design/MANIFEST.md   # the repo's own source inventory
+      manifest: docs/design/MANIFEST.md
+    pull_request: {}

@@ -1,4 +1,4 @@
-"""Compact structured results returned by validate/publish/status."""
+"""Compact structured results returned by validate/push/refresh/status."""
 
 from __future__ import annotations
 
@@ -34,16 +34,16 @@ class ErrorInfo(BaseModel):
 
 
 class PullRequestInfo(BaseModel):
-    state: Literal["created", "existing", "failed", "skipped"]
+    state: Literal["created", "existing", "failed"]
     number: int | None = None
     url: str | None = None
     base: str | None = None
     error: str | None = None
 
 
-class PublishOutcome(BaseModel):
+class PushOutcome(BaseModel):
     ok: bool = False
-    operation: Literal["validate", "publish"]
+    operation: Literal["validate", "push"]
     repository: str | None = None
     branch: str | None = None
     expected_base_sha: str | None = None
@@ -56,19 +56,19 @@ class PublishOutcome(BaseModel):
     insertions: int = 0
     deletions: int = 0
     validation: ValidationReport | None = None
-    git_publish: Literal["success", "failed", "skipped"] = "skipped"
-    # Drive refresh after a successful publication. A failure here never
-    # changes git_publish; retry with POST /repos/{repo}/refresh.
-    snapshot_refresh: Literal["success", "failed", "skipped", "not_configured"] = "skipped"
-    snapshot_commit: str | None = None
-    snapshot_error: str | None = None
-    # Pull request from the branch into its configured base (if configured).
+    git_push: Literal["success", "failed", "skipped"] = "skipped"
+    # Pull request working -> integration branch (if configured).
     pull_request: PullRequestInfo | None = None
+    # Drive refresh after a successful push. A failure here never changes
+    # git_push; retry with POST /repos/{repo}/refresh.
+    snapshot_refresh: Literal["success", "failed", "skipped", "not_configured"] = "skipped"
+    snapshot_generation_id: str | None = None
+    snapshot_error: str | None = None
     error: ErrorInfo | None = None
     # One human-readable line, e.g. for display in an iOS Shortcut.
     message: str = ""
 
-    def summarise(self) -> "PublishOutcome":
+    def summarise(self) -> "PushOutcome":
         if self.error is not None:
             self.message = f"Rejected ({self.error.code}): {self.error.message}"
         elif self.operation == "validate":
@@ -78,7 +78,7 @@ class PublishOutcome(BaseModel):
             )
         else:
             self.message = (
-                f"Published {(self.new_sha or '')[:12]} to {self.repository}@{self.branch}: "
+                f"Pushed {(self.new_sha or '')[:12]} to {self.repository}@{self.branch}: "
                 f"{self.files_changed} file(s), +{self.insertions} -{self.deletions}."
             )
             pr = self.pull_request
@@ -95,28 +95,46 @@ class PublishOutcome(BaseModel):
         return self
 
 
-class BranchStatus(BaseModel):
+class BranchHead(BaseModel):
     branch: str
-    remote_sha: str | None
+    commit: str | None = None
     error: str | None = None
 
 
 class SnapshotInfo(BaseModel):
-    state: str | None = None
-    commit: str | None = None
+    """What is currently in the snapshot store."""
+
     generation_id: str | None = None
     generated_at: str | None = None
+    integration_commit: str | None = None
+    working_commit: str | None = None
+    snapshot_name: str | None = None
+    working_diff_name: str | None = None
     file_count: int | None = None
-    archive: str | None = None
+    # Both artifacts belong to the same generation.
+    consistent: bool | None = None
     error: str | None = None
 
 
 class RepositoryStatus(BaseModel):
     repository: str
     key: str
-    branches: list[BranchStatus]
-    export_branch: str | None = None
+    integration: BranchHead
+    working: BranchHead
+    merge_base_commit: str | None = None
+    working_ahead_by: int | None = None
+    working_behind_by: int | None = None
     snapshot: SnapshotInfo | None = None
+
+
+class WorkingDiffInfo(BaseModel):
+    filename: str
+    sha256: str
+    bytes: int
+    empty: bool
+    files_changed: int
+    insertions: int
+    deletions: int
 
 
 class RefreshOutcome(BaseModel):
@@ -124,35 +142,37 @@ class RefreshOutcome(BaseModel):
     operation: Literal["refresh"] = "refresh"
     repository: str
     key: str
-    branch: str | None = None
-    commit: str | None = None
-    previous_commit: str | None = None
+    integration_branch: str
+    working_branch: str
+    integration_commit: str | None = None
+    working_commit: str | None = None
+    merge_base_commit: str | None = None
+    working_ahead_by: int | None = None
+    working_behind_by: int | None = None
     generation_id: str | None = None
+    uploaded: bool = False
+    snapshot_name: str | None = None
+    snapshot_sha256: str | None = None
+    snapshot_bytes: int | None = None
     file_count: int = 0
-    exported: int = 0
-    uploaded: int = 0
-    unchanged: int = 0
-    deleted: int = 0
     not_exported: int = 0
-    archive_name: str | None = None
-    archive_bytes: int | None = None
-    archive_sha256: str | None = None
+    working_diff: WorkingDiffInfo | None = None
     error: ErrorInfo | None = None
     message: str = ""
 
     def summarise(self) -> "RefreshOutcome":
         if self.error is not None:
             self.message = f"Snapshot refresh failed ({self.error.code}): {self.error.message}"
-        elif self.archive_name is not None:
-            state = "uploaded" if self.uploaded else "unchanged"
-            self.message = (
-                f"Snapshot of {self.repository}@{self.branch} at {(self.commit or '')[:12]}: "
-                f"{self.exported} file(s) in {self.archive_name} ({state})."
-            )
-        else:
-            self.message = (
-                f"Snapshot of {self.repository}@{self.branch} at {(self.commit or '')[:12]}: "
-                f"{self.exported} file(s) exported ({self.uploaded} updated, {self.unchanged} unchanged, "
-                f"{self.deleted} removed)."
-            )
+            return self
+        diff = self.working_diff
+        overlay = (
+            "no working changes"
+            if diff is None or diff.empty
+            else f"overlay {diff.files_changed} file(s) +{diff.insertions} -{diff.deletions}"
+        )
+        self.message = (
+            f"{self.repository}: {self.integration_branch} {(self.integration_commit or '')[:12]} "
+            f"({self.file_count} file(s)) + {self.working_branch} {(self.working_commit or '')[:12]} "
+            f"({overlay}); {'uploaded' if self.uploaded else 'unchanged'}."
+        )
         return self

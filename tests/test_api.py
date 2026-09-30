@@ -66,7 +66,7 @@ def test_interactive_docs_and_schema_are_disabled(client):
         ("get", "/repos/rot3k/status"),
         ("post", "/repos/rot3k/refresh"),
         ("post", "/repos/rot3k/validate-patch"),
-        ("post", "/repos/rot3k/publish"),
+        ("post", "/repos/rot3k/push"),
     ],
 )
 def test_missing_or_invalid_token_is_401(client, method, path, headers):
@@ -90,7 +90,7 @@ def test_tokens_never_logged(gitenv: GitEnv, caplog):
     client = _client(gitenv, audit_log=audit, github_token_file=token_file)
     caplog.set_level(logging.DEBUG)
     base, patch = gitenv.make_patch({"MANIFEST.md": "x\n"})
-    client.post("/repos/rot3k/publish", content=artifact_zip(patch, base), headers={"Authorization": "Bearer wrong" + "z" * 40})
+    client.post("/repos/rot3k/push", content=artifact_zip(patch, base), headers={"Authorization": "Bearer wrong" + "z" * 40})
     client.post("/repos/rot3k/validate-patch", content=artifact_zip(patch, base), headers=AUTH)
     logged = caplog.text + audit.read_text()
     assert "auth_failed" in logged
@@ -117,7 +117,9 @@ def test_app_refuses_short_token(gitenv: GitEnv):
 def test_status(client, gitenv: GitEnv):
     r = client.get("/repos/rot3k/status", headers=AUTH)
     assert r.status_code == 200
-    assert r.json()["branches"][0]["remote_sha"] == gitenv.head()
+    body = r.json()
+    assert body["working"] == {"branch": "design-docs", "commit": gitenv.head(), "error": None}
+    assert body["integration"]["commit"] == gitenv.head("main")
 
 
 def test_validate_patch_raw_body(client, gitenv: GitEnv):
@@ -134,24 +136,32 @@ def test_validate_patch_raw_body(client, gitenv: GitEnv):
     assert gitenv.head() == base
 
 
-def test_publish_raw_body(client, gitenv: GitEnv):
+def test_push_raw_body(client, gitenv: GitEnv):
     base, patch = gitenv.make_patch({"records/new.md": "hello\n"})
-    r = client.post("/repos/rot3k/publish", content=artifact_zip(patch, base), headers=AUTH)
+    r = client.post("/repos/rot3k/push", content=artifact_zip(patch, base), headers=AUTH)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["ok"] and body["git_publish"] == "success"
+    assert body["ok"] and body["git_push"] == "success"
     assert body["old_sha"] == base and body["new_sha"] == gitenv.head()
     assert body["changed_files"] == [{"path": "records/new.md", "insertions": 1, "deletions": 0}]
     assert body["validation"]["passed"]
     assert body["snapshot_refresh"] == "not_configured"
-    assert body["message"].startswith(f"Published {body['new_sha'][:12]}")
+    assert body["operation"] == "push"
+    assert body["message"].startswith(f"Pushed {body['new_sha'][:12]}")
 
 
-def test_publish_multipart_upload(client, gitenv: GitEnv):
+def test_deprecated_publish_path_still_pushes(client, gitenv: GitEnv):
+    base, patch = gitenv.make_patch({"records/alias.md": "alias\n"})
+    r = client.post("/repos/rot3k/publish", content=artifact_zip(patch, base), headers=AUTH)
+    assert r.status_code == 200 and r.json()["git_push"] == "success"
+    assert gitenv.head() == r.json()["new_sha"]
+
+
+def test_push_multipart_upload(client, gitenv: GitEnv):
     base, patch = gitenv.make_patch({"records/multi.md": "multipart\n"})
     r = client.post(
-        "/repos/rot3k/publish",
-        files={"file": ("rot3k-publish.zip", artifact_zip(patch, base), "application/zip")},
+        "/repos/rot3k/push",
+        files={"file": ("rot3k-push.zip", artifact_zip(patch, base), "application/zip")},
         headers=AUTH,
     )
     assert r.status_code == 200, r.text
@@ -162,7 +172,7 @@ def test_multipart_with_two_files_rejected(client, gitenv: GitEnv):
     base, patch = gitenv.make_patch({"a.md": "a\n"})
     z = artifact_zip(patch, base)
     r = client.post(
-        "/repos/rot3k/publish",
+        "/repos/rot3k/push",
         files=[("file", ("a.zip", z, "application/zip")), ("file", ("b.zip", z, "application/zip"))],
         headers=AUTH,
     )
@@ -170,32 +180,32 @@ def test_multipart_with_two_files_rejected(client, gitenv: GitEnv):
     assert gitenv.head() == base
 
 
-def test_publish_remote_changed_is_409(client, gitenv: GitEnv):
+def test_push_remote_changed_is_409(client, gitenv: GitEnv):
     base, patch = gitenv.make_patch({"MANIFEST.md": "late\n"})
     gitenv.advance_remote()
-    r = client.post("/repos/rot3k/publish", content=artifact_zip(patch, base), headers=AUTH)
+    r = client.post("/repos/rot3k/push", content=artifact_zip(patch, base), headers=AUTH)
     assert r.status_code == 409
     body = r.json()
-    assert body["error"]["code"] == "remote_changed" and body["git_publish"] == "failed"
+    assert body["error"]["code"] == "remote_changed" and body["git_push"] == "failed"
     assert body["message"].startswith("Rejected (remote_changed)")
 
 
 def test_malformed_upload_is_400(client):
-    r = client.post("/repos/rot3k/publish", content=b"not a zip", headers=AUTH)
+    r = client.post("/repos/rot3k/push", content=b"not a zip", headers=AUTH)
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "invalid_artifact"
 
 
 def test_oversized_upload_is_413(gitenv: GitEnv):
     client = _client(gitenv, limits=Limits(max_archive_bytes=1000))
-    r = client.post("/repos/rot3k/publish", content=b"\0" * 5000, headers=AUTH)
+    r = client.post("/repos/rot3k/push", content=b"\0" * 5000, headers=AUTH)
     assert r.status_code == 413
     assert r.json()["error"]["code"] == "artifact_too_large"
 
 
 def test_disallowed_branch_is_403(client, gitenv: GitEnv):
     base, patch = gitenv.make_patch({"MANIFEST.md": "x\n"})
-    r = client.post("/repos/rot3k/publish", content=artifact_zip(patch, base, branch="main"), headers=AUTH)
+    r = client.post("/repos/rot3k/push", content=artifact_zip(patch, base, branch="main"), headers=AUTH)
     assert r.status_code == 403
 
 
@@ -203,13 +213,13 @@ def test_audit_log_is_append_only_jsonl(gitenv: GitEnv):
     audit = gitenv.tmp / "logs" / "audit.jsonl"
     client = _client(gitenv, audit_log=audit)
     base, patch = gitenv.make_patch({"a.md": "a\n"})
-    client.post("/repos/rot3k/publish", content=artifact_zip(patch, base), headers=AUTH)
-    client.post("/repos/rot3k/publish", content=artifact_zip(patch, base), headers=AUTH)  # now stale
+    client.post("/repos/rot3k/push", content=artifact_zip(patch, base), headers=AUTH)
+    client.post("/repos/rot3k/push", content=artifact_zip(patch, base), headers=AUTH)  # now stale
     events = [json.loads(line) for line in audit.read_text().splitlines()]
-    publishes = [e for e in events if e["event"] == "publish"]
-    assert [e["ok"] for e in publishes] == [True, False]
-    assert publishes[1]["error"] == "remote_changed"
-    assert publishes[0]["expected_sha"] == base and publishes[0]["new_sha"]
+    pushes = [e for e in events if e["event"] == "push"]
+    assert [e["ok"] for e in pushes] == [True, False]
+    assert pushes[1]["error"] == "remote_changed"
+    assert pushes[0]["expected_sha"] == base and pushes[0]["new_sha"]
     assert all("ts" in e for e in events)
 
 

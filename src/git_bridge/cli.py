@@ -108,20 +108,20 @@ def check(settings: Settings) -> int:
         repo = bridge.repository(key)
         try:
             repo.ensure_clone()
-            for branch in repo.config.allowed_branches:
-                sha = repo.fetch(branch)
-                report(f"{key}: fetch {branch}", True, sha[:12])
+            integration, working = repo.fetch_heads()
+            report(f"{key}: integration {repo.config.integration_branch}", True, integration[:12])
+            report(f"{key}: working {repo.config.working_branch}", True, working[:12])
         except BridgeError as exc:
             report(f"{key}: fetch", False, f"{exc.message} {exc.details.get('stderr', '')}".strip())
         pr = repo.config.pull_request
         if pr is not None and repo.github is not None:
-            for branch in repo.config.allowed_branches:
-                try:
-                    found = repo.github.find_open_pull_request(repo.config.github_repo, branch, pr.base)
-                    detail = f"open PR #{found['number']}" if found else "no open PR (one will be opened on publish)"
-                    report(f"{key}: pull requests {branch} -> {pr.base}", True, detail)
-                except BridgeError as exc:
-                    report(f"{key}: pull requests {branch} -> {pr.base}", False, exc.message)
+            head, base = repo.config.working_branch, repo.config.integration_branch
+            try:
+                found = repo.github.find_open_pull_request(repo.config.github_repo, head, base)
+                detail = f"open PR #{found['number']}" if found else "no open PR (one will be opened on push)"
+                report(f"{key}: pull requests {head} -> {base}", True, detail)
+            except BridgeError as exc:
+                report(f"{key}: pull requests {head} -> {base}", False, exc.message)
     return 0 if ok else 1
 
 
@@ -162,8 +162,8 @@ def main(argv: list[str] | None = None) -> int:
     p_tok.add_argument("--force", action="store_true", help="replace an existing token")
     for name in ("status", "refresh"):
         sub.add_parser(name).add_argument("repo")
-    for name in ("validate", "publish"):
-        p = sub.add_parser(name, help=f"{name} a publish.zip from the local filesystem")
+    for name in ("validate", "push"):
+        p = sub.add_parser(name, help=f"{name} a <key>-push.zip from the local filesystem")
         p.add_argument("repo")
         p.add_argument("zip", type=Path)
     args = parser.parse_args(argv)
@@ -210,7 +210,7 @@ def main(argv: list[str] | None = None) -> int:
             result = repo.refresh()
         else:
             artifact = parse_artifact(args.zip.read_bytes(), settings.limits)
-            result = repo.validate_patch(artifact) if args.command == "validate" else repo.publish_and_refresh(artifact)
+            result = repo.validate_patch(artifact) if args.command == "validate" else repo.push_and_refresh(artifact)
         _print(result)
         return 0 if getattr(result, "ok", True) else 1
     except BridgeError as exc:
