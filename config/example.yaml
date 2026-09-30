@@ -35,12 +35,11 @@ limits:
 # local_path and drive_root must not overlap between repositories.
 repositories:
   rot3k:
-    # The GitHub repository is currently named rt3k. After renaming it on
-    # GitHub, set github_repo: iascus/rot3k and former_github_repos: [iascus/rt3k]
-    # -- the key, Shortcuts and Drive folder stay the same, in-flight push
-    # artifacts naming rt3k are still accepted, and the clone is re-pointed.
-    github_repo: iascus/rt3k
-    former_github_repos: []
+    # Renamed on GitHub from rt3k: the key, Shortcuts and Drive folder stay the
+    # same, push artifacts naming the old repository are still accepted, and
+    # the local clone was re-pointed automatically.
+    github_repo: iascus/rot3k
+    former_github_repos: [iascus/rt3k]
     local_path: /var/lib/git-bridge/repos/rot3k   # persistent bare clone
     remote: origin
     # remote_url defaults to https://github.com/<github_repo>.git

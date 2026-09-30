@@ -29,7 +29,8 @@ google:
 
 repositories:
   rot3k:
-    github_repo: iascus/rt3k          # rename later: iascus/rot3k + former_github_repos: [iascus/rt3k]
+    github_repo: iascus/rot3k
+    former_github_repos: [iascus/rt3k]   # renamed on GitHub; old name still accepted
     local_path: C:/Users/YOU/AppData/Local/agent-git-bridge/repos/rot3k.git
     integration_branch: main          # complete snapshot (read only)
     working_branch: design-docs       # overlay; the only branch pushes advance

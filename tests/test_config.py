@@ -16,7 +16,8 @@ def test_example_config_is_valid():
     assert set(settings.repositories) == {"rot3k", "cyberpunk-tactics"}
     repo = settings.repositories["rot3k"]
     assert (repo.integration_branch, repo.working_branch) == ("main", "design-docs")
-    assert repo.effective_remote_url == "https://github.com/iascus/rt3k.git"
+    assert repo.effective_remote_url == "https://github.com/iascus/rot3k.git"
+    assert repo.former_github_repos == ["iascus/rt3k"]
 
 
 def test_unknown_keys_rejected(tmp_path):
