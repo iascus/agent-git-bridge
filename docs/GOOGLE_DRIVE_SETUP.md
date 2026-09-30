@@ -92,7 +92,7 @@ Access tokens last an hour and are refreshed automatically with the stored
 refresh token; the refreshed token is written back to `token_file`. The
 refresh token itself does not expire for a production-status app unless it
 is revoked, unused for six months, or your Google account password changes
-with certain security settings. When it stops working, refresh and publish
+with certain security settings. When it stops working, refresh and push
 responses report `snapshot_refresh: failed` with "Google login expired or was
 revoked", and `git-bridge check` shows `[FAIL] Google login`. Fix with
 `git-bridge google-login`. Git publication is never affected.

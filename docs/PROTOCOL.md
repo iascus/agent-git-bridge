@@ -1,159 +1,148 @@
 # Protocol
 
-Two data formats cross the trust boundary: the **snapshot** the bridge
-exports to Google Drive (pull), and the **publication artifact** ChatGPT
-produces (push). Both are versioned with `format_version`.
+Two data formats cross the trust boundary:
 
-## Pull: the Drive snapshot
+- **Pull**: per project, a refresh *generation* the bridge writes to Google
+  Drive: the integration-branch snapshot and the integration → working
+  overlay (format version 2).
+- **Push**: the ZIP ChatGPT produces to advance the working branch.
 
-### Archive format (default)
+Terminology: **Push** advances the working branch. **Integration** is the
+working branch's changes entering the integration branch through a pull
+request the user merges; the bridge never merges or rebases.
 
-One ZIP per repository with a **stable name**, replaced in place (same Drive
-file ID) in a single write, so a reader always gets one complete commit:
+## Pull: snapshot + working overlay
 
-```text
-My Drive/
-└── ChatGPT/rot3k/
-    └── rot3k-snapshot.zip         name: export.archive_name, default <key>-snapshot.zip
-        ├── snapshot.json          first entry; describes every file in the ZIP
-        ├── AGENTS.md              selected files at their repository paths
-        ├── docs/design/MANIFEST.md
-        └── …
-```
-
-- The ZIP is deterministic (fixed timestamps, sorted entries). If commit and
-  file selection are unchanged, it is not re-uploaded.
-- `snapshot.json` inside the ZIP has the schema below with `state:
-  "complete"` (always), `"archive": "<name>"`, and no `drive_file_id`s.
-- Drive `appProperties` of the ZIP (private to the bridge) record commit,
-  generation ID, SHA-256, size and a content fingerprint.
-- Switching from the files format moves the per-file exports to the Drive
-  trash after the ZIP has been written.
-
-Reader: download the ZIP, unzip, read `snapshot.json`, then the `bootstrap`
-files; open `lazy` files from the unzipped tree when needed.
-
-### Files format (`export.format: files`)
-
-Every selected file individually, plus `snapshot.json`:
+Per project (key `rot3k` in the examples), `export.drive_root` holds exactly:
 
 ```text
-My Drive/
-└── <drive_root>/                  e.g. ChatGPT/rot3k
-    ├── snapshot.json              authoritative description, written last
-    ├── AGENTS.md                  repository files at their relative paths
-    ├── docs/
-    │   └── design/MANIFEST.md
-    └── …
+My Drive/ChatGPT/rot3k/
+├── rot3k-snapshot.zip      integration branch (M), complete source set
+│   ├── snapshot.json       first entry; describes both states
+│   ├── AGENTS.md
+│   ├── docs/design/MANIFEST.md
+│   └── …                   files listed by M's manifest
+└── rot3k-working.diff      tree diff M → D (working branch), text patch
 ```
 
-### `snapshot.json` (format_version 1)
+Both files keep a stable name and Drive file ID across refreshes; names can
+be set with `export.snapshot_name` / `export.working_diff_name`.
 
-Complete snapshot:
+### What is exported
+
+The repository's manifest (`export.manifest`) lists the project source set in
+its `PROJECT_SOURCE_FILES` block. Each branch is read with **its own**
+manifest: sel(M) from M's manifest, sel(D) from D's. Listed files that are
+missing, binary, symlinks or too large are excluded and reported in
+`not_exported` (reasons `missing`, `binary`, `symlink`, `too_large`,
+`unsupported_path`).
+
+### `snapshot.json` (format_version 2)
 
 ```json
 {
-  "format_version": 1,
-  "state": "complete",
-  "generation_id": "20260928T160000Z-89f1da60677d-3fa2c1",
+  "format_version": 2,
+  "generation_id": "20260930T101500Z-3e7e51c0-237852e3-a1b2c3",
+  "generated_at": "2026-09-30T10:15:00Z",
   "repository": "iascus/rt3k",
-  "repository_key": "rot3k",
-  "branch": "design-docs",
-  "commit": "89f1da60677d…",
-  "tree": "…",
-  "generated_at": "2026-09-28T16:00:00Z",
-  "previous_commit": "…",
-  "drive_root": "ChatGPT/rot3k",
-  "snapshot_file": "snapshot.json",
-  "reader_notes": "…",
-  "counts": {"listed": 1651, "exported": 1651, "bootstrap": 5, "index": 7, "lazy": 1639},
+  "project_key": "rot3k",
+
+  "integration_branch": "main",
+  "integration_commit": "3e7e51c0…",
+  "working_branch": "design-docs",
+  "working_commit": "237852e3…",
+  "merge_base_commit": "3e7e51c0…",
+  "working_ahead_by": 4,
+  "working_behind_by": 0,
+
+  "manifest_path": "docs/design/MANIFEST.md",
   "files": {
-    "AGENTS.md": {
-      "blob_sha": "…", "size": 5120, "class": "bootstrap",
-      "exported": true, "mime_type": "text/markdown", "drive_file_id": "1AbC…"
-    },
-    "docs/characters/records-juan-23/x.md": {
-      "blob_sha": "…", "size": 89321, "class": "lazy", "exported": true, "…": "…"
-    },
-    "assets/logo.bin": {
-      "blob_sha": "…", "size": 2048, "class": "lazy", "exported": false, "reason": "binary"
-    }
-  }
+    "AGENTS.md": {"blob_sha": "…", "size": 5120}
+  },
+  "not_exported": {"docs/missing.md": "missing"},
+
+  "working_diff": {
+    "filename": "rot3k-working.diff",
+    "sha256": "…",
+    "bytes": 18234,
+    "base_commit": "3e7e51c0…",
+    "target_commit": "237852e3…",
+    "empty": false,
+    "files_changed": 3,
+    "insertions": 120,
+    "deletions": 14,
+    "working_files": {"AGENTS.md": "<blob sha>", "…": "…"},
+    "working_not_exported": {}
+  },
+  "reader_notes": "…"
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `state` | `complete`, or `updating` while an export is in progress (see below). |
-| `commit` | The single Git commit every listed file comes from. |
-| `generation_id` | Unique per export; changes even if the commit does not. |
-| `files.<path>.blob_sha` | Git blob SHA of the file at `commit` (`git rev-parse <commit>:<path>`). |
-| `files.<path>.class` | `bootstrap`: read at conversation start. `index`: catalogues, read at start. `lazy`: read only when needed. |
-| `files.<path>.exported` | `false` when listed but not present in Drive; `reason` is `binary`, `too_large`, `symlink` or `unsupported_path`. |
-| `files.<path>.drive_file_id` | Drive file ID; stable across exports while the path exists. |
+| `integration_commit` (M) | The single commit every file in the ZIP comes from. |
+| `working_commit` (D) | The working-branch head; **the base for pushes**. |
+| `merge_base_commit`, `working_ahead_by`, `working_behind_by` | Branch relationship, informational only. |
+| `files` | sel(M): path → Git blob SHA (`git rev-parse M:path`) and size. |
+| `working_diff.sha256` / `bytes` | Identify the overlay file of the same generation. |
+| `working_diff.working_files` | sel(D): path → blob SHA, to verify a reconstruction. |
+| `working_diff.empty` | true when sel(D) == sel(M); the overlay has no patch body. |
 
-Files matched by `exclude`, or by no rule at all, are not listed.
+### `<key>-working.diff`
 
-### Selection by the repository's manifest
-
-With `export.manifest: docs/design/MANIFEST.md` the bridge reads that file
-**at the exported commit** and exports exactly the paths in its
-`project_source_files` block (between `<!-- PROJECT_SOURCE_FILES_BEGIN -->`
-and `<!-- PROJECT_SOURCE_FILES_END -->`), minus configured `exclude`s. An
-optional `project_source_materialization` block
-(`<!-- PROJECT_SOURCE_MATERIALIZATION_BEGIN/END -->`) sets `default`
-(`bootstrap`) and named lazy classes with `globs`/`paths`; a lazy file's
-entry carries `"lazy_class": "<name>"`. A listed path absent from the commit
-appears with `exported: false, reason: "missing"`. A malformed manifest, a
-duplicate or unsafe path, or a path matching two lazy classes fails the
-refresh. `snapshot.json` then includes
-`"selection": {"source": "manifest", "manifest": "…", "manifest_blob_sha": "…"}`.
-
-While an export runs, `snapshot.json` is replaced by a marker:
-
-```json
-{
-  "format_version": 1,
-  "state": "updating",
-  "generation_id": "…",
-  "repository": "iascus/rt3k",
-  "repository_key": "rot3k",
-  "branch": "design-docs",
-  "previous_commit": "…",
-  "target_commit": "…",
-  "started_at": "2026-09-28T16:00:00Z",
-  "reader_notes": "…"
-}
-```
-
-**Reader rules**
-
-1. Read `snapshot.json` first. If `state` is not `complete`, the files are in
-   flux: wait and read it again (or ask the user to run *Refresh Git Snapshot*).
-2. Read all `bootstrap` and `index` files.
-3. Read `lazy` files only when the task needs them.
-4. Use `commit` as `expected_base_sha` when proposing changes.
-
-### Export order (files format)
-
-1. Write `snapshot.json` with `state: updating`.
-2. Upload new/changed files in place (unchanged blob SHA ⇒ skipped); move
-   files that are no longer exported to the Drive trash.
-3. Write the final `snapshot.json` with `state: complete` — always last.
-
-A crash between 1 and 3 leaves the `updating` marker in place, which is
-accurate. The next successful refresh completes it.
-
-## Push: the publication artifact
+A deterministic text patch (`git diff-tree -p -M --full-index`, prefixes
+`a/` and `b/`) from the tree of sel(M) to the tree of sel(D), preceded by a
+comment header that `git apply` ignores:
 
 ```text
-<repo>-publish.zip
+# agent-git-bridge working-branch overlay
+# generation: 20260930T101500Z-3e7e51c0-237852e3-a1b2c3
+# repository: iascus/rt3k
+# base: main 3e7e51c0…
+# target: design-docs 237852e3…
+# apply to the unzipped snapshot with: git apply
+
+diff --git a/docs/design/RULES.md b/docs/design/RULES.md
+…
+```
+
+It is the exact **tree** difference, not the working branch's commits and not
+"changes since the merge base". If `main` has advanced and the working branch
+has not been rebased, the overlay legitimately shows main-only changes being
+reverted. After an external rebase, the next refresh reflects the new heads.
+
+**Invariant:** unzipping the snapshot and applying the overlay reproduces
+sel(D) byte for byte (verified by `working_diff.working_files`).
+
+### Reader procedure
+
+1. Download `<key>-snapshot.zip`, unzip, read `snapshot.json`.
+2. Download `<key>-working.diff`. Check `sha256(file) ==
+   working_diff.sha256` (and the `# generation:` line). On mismatch a refresh
+   is in progress or failed: download both again (or ask the user to run
+   *Refresh Git Snapshot*). Never combine files from different generations.
+3. Keep the unzipped tree as **M**. Copy it, `git apply` the overlay (skip if
+   `working_diff.empty`): that is **D**. Work on a copy of D: that is **H**.
+4. Derived views: Diff = D → H; Full diff = M → H; Integration/PR diff =
+   M → D (the overlay); Push = D → H.
+
+### Export order and consistency
+
+A refresh resolves M and D with one fetch, builds both artifacts from that
+pair, writes the overlay first and the snapshot last. The snapshot pins the
+overlay's SHA-256, so a half-finished or failed refresh is always detectable.
+An unchanged (M, D, selection) is not re-uploaded.
+
+## Push: the push artifact
+
+```text
+<key>-push.zip            e.g. rot3k-push.zip
 ├── request.json
-└── changes.patch
+└── changes.patch         working tree D → ChatGPT HEAD H
 ```
 
 Exactly these two members, at the top level, stored or deflated, not
-encrypted. Anything else is rejected.
+encrypted.
 
 ### `request.json` (format_version 1)
 
@@ -162,136 +151,153 @@ encrypted. Anything else is rejected.
   "format_version": 1,
   "repository": "iascus/rt3k",
   "branch": "design-docs",
-  "expected_base_sha": "89f1da60677d0c0e5a1c6d2f8e4b3a2918273645",
-  "patch_sha256": "5d41402abc4b2a76b9719d911017c592…",
+  "expected_base_sha": "<working_commit from snapshot.json>",
+  "patch_sha256": "<sha256 of changes.patch>",
   "commit_message": "Refine encounter activation UI",
-  "created_at": "2026-09-28T16:00:00Z",
+  "created_at": "2026-09-30T10:20:00Z",
   "generator": "chatgpt"
 }
 ```
 
 | Field | Rules |
 |---|---|
-| `format_version` | Integer `1`. |
-| `repository` | `owner/name`; must be the configured repository of the endpoint (or a declared former name). |
-| `branch` | Must be in the repository's `allowed_branches`. |
-| `expected_base_sha` | Full 40-character lowercase hex commit ID (64 for SHA-256 repositories). Abbreviations are rejected. |
-| `patch_sha256` | SHA-256 of `changes.patch` bytes, hex. Detects corruption only. |
-| `commit_message` | Non-blank, no NUL, at most 16 KiB. Used verbatim apart from trimming trailing whitespace. |
-| `created_at`, `generator` | Optional, informational, never used for decisions. |
+| `repository` | `owner/name`; the endpoint's repository (or a declared former name). |
+| `branch` | Must be the configured **working branch**. Pushes to the integration branch are refused. |
+| `expected_base_sha` | Full hex commit ID; must equal the working branch head (`working_commit`), not `integration_commit`. |
+| `patch_sha256` | SHA-256 of `changes.patch`; detects corruption only. |
+| `commit_message` | Non-blank, no NUL, ≤ 16 KiB. |
+| `created_at`, `generator` | Optional, informational. |
 
-Unknown fields and duplicate keys are rejected.
-
-### `changes.patch`
-
-A `git diff`-format patch relative to `expected_base_sha`, applied with
-`git apply --index` (paths `a/…` and `b/…`, strip level 1). Text changes only:
-
-- adding, modifying, deleting and renaming regular files is allowed;
-- symlinks, submodules, binary patches and paths matching `denied_paths`
-  are rejected;
-- whitespace errors in added lines fail `git diff --check`.
+Unknown fields and duplicate keys are rejected. `changes.patch` is a `git
+diff` from D (paths `a/…`, `b/…`), text files only; symlinks, submodules,
+binary patches and `denied_paths` are rejected; added lines must pass `git
+diff --check`.
 
 ### Limits (defaults)
 
-| Limit | Default |
-|---|---|
-| Upload (compressed) | 5 MiB |
-| Total decompressed | 20 MiB |
-| Per member | 16 MiB |
-| Entries | 8 |
-| `request.json` | 64 KiB |
+Upload 5 MiB compressed, 20 MiB decompressed, 16 MiB per member, 8 entries,
+`request.json` 64 KiB.
 
-### Responses
+### Endpoints and responses
 
-Every validate/publish response is one JSON object:
+`POST /repos/<key>/push` (deprecated alias: `/publish`), `POST
+/repos/<key>/validate-patch` (checks only), `POST /repos/<key>/refresh`,
+`GET /repos/<key>/status`.
+
+Push response:
 
 ```json
 {
   "ok": true,
-  "operation": "publish",
+  "operation": "push",
   "repository": "iascus/rt3k",
   "branch": "design-docs",
-  "expected_base_sha": "…",
-  "observed_sha": "…",
-  "old_sha": "…",
-  "new_sha": "…",
+  "expected_base_sha": "…", "observed_sha": "…", "old_sha": "…", "new_sha": "…",
   "changed_files": [{"path": "docs/x.md", "insertions": 3, "deletions": 1}],
-  "files_changed": 1,
-  "insertions": 3,
-  "deletions": 1,
+  "files_changed": 1, "insertions": 3, "deletions": 1,
   "validation": {"passed": true, "checks": [{"name": "git diff --check", "passed": true, "exit_code": 0, "duration_ms": 12, "output_tail": ""}]},
-  "git_publish": "success",
+  "git_push": "success",
+  "pull_request": {"state": "created", "number": 12, "url": "https://github.com/iascus/rt3k/pull/12", "base": "main", "error": null},
   "snapshot_refresh": "success",
-  "snapshot_commit": "…",
+  "snapshot_generation_id": "…",
   "snapshot_error": null,
-  "pull_request": {"state": "created", "number": 12, "url": "https://github.com/iascus/rt3k/pull/12", "base": "poc1", "error": null},
   "error": null,
-  "message": "Published 0a1b2c3d4e5f to iascus/rt3k@design-docs: 1 file(s), +3 -1. Drive snapshot updated."
+  "message": "Pushed 0a1b2c3d4e5f to iascus/rt3k@design-docs: 1 file(s), +3 -1. Opened PR #12 into main: … Drive snapshot updated."
 }
 ```
 
-`message` is a single human-readable line suitable for display.
+After a successful push the bridge (optionally) opens a PR working →
+integration if none is open, then refreshes from the heads as they are now
+(the new working head and the current integration head). Failures in either
+step are reported (`pull_request.state: "failed"`, `snapshot_refresh:
+"failed"`) and never turn `git_push: "success"` into a failure.
 
-`pull_request` is present when the repository configures `pull_request.base`:
-after a successful push the bridge looks for an open pull request from the
-branch into `base`; `state` is `existing` if one is open (the new commit is
-now part of it), `created` if the bridge opened one (title: the commit
-message's first line), or `failed` with `error` (the push still succeeded).
-The bridge never merges, closes or edits pull requests.
+Refresh response (abridged):
+
+```json
+{
+  "ok": true, "operation": "refresh",
+  "repository": "iascus/rt3k", "key": "rot3k",
+  "integration_branch": "main", "integration_commit": "…",
+  "working_branch": "design-docs", "working_commit": "…",
+  "merge_base_commit": "…", "working_ahead_by": 4, "working_behind_by": 0,
+  "generation_id": "…", "uploaded": true,
+  "snapshot_name": "rot3k-snapshot.zip", "file_count": 1430,
+  "working_diff": {"filename": "rot3k-working.diff", "sha256": "…", "bytes": 18234, "empty": false, "files_changed": 3, "insertions": 120, "deletions": 14},
+  "message": "iascus/rt3k: main 3e7e51c0… (1430 file(s)) + design-docs 237852e3… (overlay 3 file(s) +120 -14); uploaded."
+}
+```
 
 | HTTP | `error.code` | Meaning |
 |---|---|---|
-| 200 | — | Success (`git_publish` may be `success` with `snapshot_refresh: failed`) |
+| 200 | — | Success |
 | 400 | `invalid_artifact`, `patch_checksum_mismatch` | Archive or `request.json` invalid |
 | 401 | `unauthorized` | Missing or wrong bearer token |
-| 403 | `not_allowed` | Repository or branch not allowed for this endpoint |
-| 404 | `unknown_repository` | No such repository key |
-| 409 | `remote_changed` | Branch head ≠ `expected_base_sha`; regenerate against the new head |
-| 409 | `push_race` | Branch moved between check and push; nothing was overwritten |
+| 403 | `not_allowed` | Wrong repository, or branch is not the working branch |
+| 404 | `unknown_repository` | No such project key |
+| 409 | `remote_changed` | Working head ≠ `expected_base_sha`; refresh and regenerate |
+| 409 | `push_race` | Working branch moved between check and push |
 | 413 | `artifact_too_large` | Size limit exceeded |
-| 422 | `patch_does_not_apply`, `patch_policy_violation`, `validation_failed` | Patch rejected; nothing committed |
-| 502 | `push_rejected`, `snapshot_failed` | Remote refused the push / Drive export failed |
+| 422 | `patch_does_not_apply`, `patch_policy_violation`, `validation_failed` | Nothing committed |
+| 502 | `push_rejected`, `snapshot_failed` | Remote refused / Drive export failed |
 
 ## Instructions for the AI assistant
 
 Paste into the ChatGPT project instructions (adjust names):
 
-> **Reading the repository.** The repository snapshot is the Google Drive file
-> `ChatGPT/<repo>/<repo>-snapshot.zip`. Download it and unzip it with Python.
-> Read `snapshot.json` inside it first: `commit` is the exact version you are
-> looking at. Then read every file whose `class` is `bootstrap`. Read `lazy`
-> files from the unzipped tree only when a task needs them. Never mix files
-> from different ZIP downloads; if you fetch the ZIP again, re-read
-> `snapshot.json`.
+> **Source states.** The project is in Google Drive under `ChatGPT/<key>/`:
+> `<key>-snapshot.zip` (integration branch, complete) and `<key>-working.diff`
+> (tree diff integration → working branch). Download both. Unzip the snapshot
+> and read `snapshot.json`. Verify that the SHA-256 of the diff file equals
+> `working_diff.sha256`; if not, stop and ask me to run *Refresh Git
+> Snapshot*. Keep the unzipped files as M. Apply the diff with `git apply`
+> (skip if `working_diff.empty`) to get D, and check D's files against
+> `working_diff.working_files` (Git blob SHA-1). Make changes in a copy of D:
+> that is your HEAD H. Never query GitHub for branch state.
 >
-> **Proposing changes.** Never claim to have committed anything. When I ask you
-> to publish, produce one file `<repo>-publish.zip` containing exactly:
-> `changes.patch`, a unified `git diff` (paths prefixed `a/` and `b/`) against
-> `commit` from `snapshot.json`, text files only, no trailing whitespace on
-> added lines; and `request.json` with `format_version` 1, `repository`
-> (from `snapshot.json`), `branch`, `expected_base_sha` (= `commit`),
-> `patch_sha256` (SHA-256 hex of the exact `changes.patch` bytes), and
-> `commit_message`. Build the ZIP with Python's `zipfile` (deflated, no
-> directories, no other files), verify the checksum after writing, and give me
-> the file to download. I publish it myself from the share sheet.
+> **Views.** "Diff" = D → H. "Full diff" = M → H. "Integration diff" = M → D
+> (the overlay). If `working_behind_by` > 0, the working branch lacks recent
+> integration changes; the overlay then shows them reverted. Mention it; do
+> not try to merge.
+>
+> **Push.** When I ask to push, produce `<key>-push.zip` containing exactly
+> `changes.patch` (unified `git diff` D → H, paths `a/` and `b/`, text files
+> only, no trailing whitespace on added lines) and `request.json` with
+> `format_version` 1, `repository` (from `snapshot.json`), `branch` =
+> `working_branch`, `expected_base_sha` = `working_commit`, `patch_sha256`
+> (SHA-256 hex of the exact `changes.patch` bytes), `commit_message`. Build it
+> with Python's `zipfile` and give me the file. I push it from the share sheet.
 
-Example generator (what ChatGPT's Python tool should run):
+Example generator:
 
 ```python
 import hashlib, json, zipfile
 
-patch = open("changes.patch", "rb").read()
+patch = open("changes.patch", "rb").read()          # D -> H
+snapshot = json.load(open("M/snapshot.json"))
 request = {
     "format_version": 1,
-    "repository": "iascus/rt3k",
-    "branch": "design-docs",
-    "expected_base_sha": "<commit from snapshot.json>",
+    "repository": snapshot["repository"],
+    "branch": snapshot["working_branch"],
+    "expected_base_sha": snapshot["working_commit"],
     "patch_sha256": hashlib.sha256(patch).hexdigest(),
     "commit_message": "Refine encounter activation UI",
     "generator": "chatgpt",
 }
-with zipfile.ZipFile("rot3k-publish.zip", "w", zipfile.ZIP_DEFLATED) as zf:
+with zipfile.ZipFile(f"{snapshot['project_key']}-push.zip", "w", zipfile.ZIP_DEFLATED) as zf:
     zf.writestr("request.json", json.dumps(request, indent=2))
     zf.writestr("changes.patch", patch)
 ```
+
+## Migration from format 1
+
+- Configuration: replace `allowed_branches` with `integration_branch` and
+  `working_branch`; `export` keeps `drive_root` and `manifest` (required);
+  `format`, glob rules, `archive_name` and `pull_request.base` are gone
+  (PRs always target the integration branch; `pull_request: {}` enables them).
+- Drive: `<key>-snapshot.zip` keeps its file ID but now contains the
+  integration branch with a format-2 `snapshot.json`; `<key>-working.diff` is
+  new.
+- Push: endpoint `/push` (the old `/publish` path still works for now);
+  response field `git_push` replaces `git_publish`; `expected_base_sha` is
+  the `working_commit`.

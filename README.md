@@ -1,22 +1,34 @@
 # agent-git-bridge
 
-A small, security-conscious bridge between an AI conversation and Git:
+A small, security-conscious bridge between an AI conversation and Git.
 
-- **Pull.** Exports an exact Git commit of each configured repository to
-  Google Drive as one ZIP with a stable name (e.g.
-  `ChatGPT/rot3k/rot3k-snapshot.zip`), replaced in place, containing a
-  `snapshot.json` manifest and the files selected by the repository's own
-  source manifest. ChatGPT reads it through its normal Drive integration.
-- **Push.** ChatGPT produces a `publish.zip` (`request.json` +
-  `changes.patch`). You share it from the iOS Share Sheet to a Shortcut, which
-  POSTs it over private Tailscale HTTPS. The bridge verifies the expected base
-  commit, applies and validates the patch in an isolated worktree, commits,
-  and pushes without force. Optionally it then opens a pull request into a
-  configured base branch if none is open.
+Each project has an **integration branch** (e.g. `main`) and a **working
+branch** (e.g. `design-docs`):
+
+- **Pull.** On every refresh the bridge writes two files with stable names to
+  Google Drive, built from one resolved pair of branch heads:
+  - `<key>-snapshot.zip`: the complete project source set (as listed by the
+    repository's own manifest) of the integration branch, plus
+    `snapshot.json` describing both branch states;
+  - `<key>-working.diff`: the exact tree diff integration → working branch.
+  Applying the diff to the unzipped snapshot reproduces the working branch.
+  ChatGPT reads both through its normal Drive integration, without GitHub.
+- **Push.** ChatGPT produces `<key>-push.zip` (`request.json` +
+  `changes.patch`, working tree → its HEAD). You share it from the iOS Share
+  Sheet to a Shortcut, which POSTs it over private Tailscale HTTPS. The
+  bridge checks the working branch head against `expected_base_sha`, applies
+  and validates the patch in an isolated worktree, commits, pushes to the
+  working branch without force, optionally opens a PR into the integration
+  branch, and refreshes Drive.
+- **Integration** happens through that PR, merged by you. The bridge never
+  writes to the integration branch, merges or rebases.
 
 ```text
-GitHub ──► bridge ──► Google Drive ──► ChatGPT
-ChatGPT ──► publish.zip ──► iOS Share Sheet ──► Tailscale HTTPS ──► bridge ──► GitHub
+main ───────────────► complete source snapshot
+ │
+ └── tree diff ─────► working overlay ◄──── design-docs
+
+ChatGPT ──► <key>-push.zip ──► iOS Share Sheet ──► Tailscale HTTPS ──► bridge ──► design-docs ──PR──► main
 ```
 
 The bridge holds the GitHub and Google credentials; ChatGPT and the phone
@@ -27,13 +39,13 @@ is no generic Git, shell or file endpoint.
 
 | Document | Contents |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Design, diagrams, trust boundary, deviations from the original spec |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Branch roles, source states, generations, diagrams, trust boundary |
 | [SECURITY.md](SECURITY.md) | Controls, known risks, credential rotation |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | `snapshot.json` and `publish.zip` formats, responses, instructions for ChatGPT |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | `snapshot.json` v2, overlay, push ZIP, responses, instructions for ChatGPT, migration |
 | [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Windows scheduled task, Linux systemd, secrets, updates, recovery |
 | [docs/TAILSCALE_SETUP.md](docs/TAILSCALE_SETUP.md) | Serve setup and exposure verification |
 | [docs/GOOGLE_DRIVE_SETUP.md](docs/GOOGLE_DRIVE_SETUP.md) | Cloud project, OAuth, login, revocation |
-| [docs/IOS_SHORTCUTS.md](docs/IOS_SHORTCUTS.md) | *Publish Git Patch* and *Refresh Git Snapshot* |
+| [docs/IOS_SHORTCUTS.md](docs/IOS_SHORTCUTS.md) | *Push Git Patch* and *Refresh Git Snapshot* |
 | [PRIVACY.md](PRIVACY.md) | Privacy policy for the Google OAuth app |
 
 ## Quick start
@@ -49,7 +61,7 @@ pytest                                # no network needed
 cp config/example.yaml ~/.config/agent-git-bridge/config.yaml   # then edit
 git-bridge init-token                 # bearer token for the Shortcuts
 git-bridge google-login               # once, in a browser
-git-bridge check                      # verifies config, tokens, remotes
+git-bridge check                      # verifies config, tokens, both branches, PR access
 git-bridge refresh rot3k              # first Drive export
 git-bridge serve                      # http://127.0.0.1:8000
 tailscale serve --bg --https=10000 http://127.0.0.1:8000
@@ -59,12 +71,12 @@ tailscale serve --bg --https=10000 http://127.0.0.1:8000
 
 | Command | Purpose |
 |---|---|
-| `git-bridge serve` | Run the HTTP service (loopback only, one worker) |
+| `git-bridge serve` | Run the HTTP service (loopback only, one worker; stops earlier instances) |
 | `git-bridge check` | Diagnose configuration and credentials |
-| `git-bridge status <repo>` | Remote heads and snapshot state |
-| `git-bridge refresh <repo>` | Export the current branch head |
-| `git-bridge validate <repo> <zip>` | Run all publication checks locally |
-| `git-bridge publish <repo> <zip>` | Publish a ZIP from the host |
+| `git-bridge status <repo>` | Both branch heads, merge base, ahead/behind, current generation |
+| `git-bridge refresh <repo>` | Export snapshot + working overlay |
+| `git-bridge validate <repo> <zip>` | Run all push checks locally |
+| `git-bridge push <repo> <zip>` | Push a ZIP from the host |
 | `git-bridge init-token [--force]` | Create or rotate the bearer token |
 | `git-bridge google-login` | One-time Google consent |
 
@@ -76,23 +88,18 @@ tailscale serve --bg --https=10000 http://127.0.0.1:8000
 | GET | `/repos/{repo}/status` | bearer |
 | POST | `/repos/{repo}/refresh` | bearer |
 | POST | `/repos/{repo}/validate-patch` | bearer, body = ZIP |
-| POST | `/repos/{repo}/publish` | bearer, body = ZIP |
+| POST | `/repos/{repo}/push` | bearer, body = ZIP (`/publish`: deprecated alias) |
 
 ## Configuration
 
 Start from [config/example.yaml](config/example.yaml) (Linux) or
-[config/example.windows.yaml](config/example.windows.yaml). Several
-repositories can be configured side by side (e.g. `rot3k` and
-`cyberpunk-tactics`); each gets its own clone, lock and Drive folder, and
-GitHub renames are handled with `former_github_repos`. Secrets (GitHub token,
-bearer token, Google credentials) live in files outside the repository,
-referenced by path.
-
-## Status
-
-All phases (Git core, HTTP service, snapshots, Google Drive, Tailscale
-deployment, iOS Shortcuts) are implemented and covered by tests using local
-bare repositories and a fake Drive.
+[config/example.windows.yaml](config/example.windows.yaml). Per repository:
+`github_repo`, `integration_branch`, `working_branch`, `export.manifest`,
+`export.drive_root`, optional `pull_request`. Several repositories can be
+configured side by side under stable project keys (e.g. `rot3k`,
+`cyberpunk-tactics`), each with its own clone, lock and Drive folder; GitHub
+renames are handled with `former_github_repos`. Secrets live in files outside
+the repository, referenced by path.
 
 ## License
 

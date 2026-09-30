@@ -1,7 +1,7 @@
 # Security
 
 agent-git-bridge lets an AI assistant *propose* Git changes and read exact
-repository snapshots, while publication stays an explicit user action. This
+repository snapshots, while pushing to Git stays an explicit user action. This
 document states what it protects, how, and what it does not.
 
 ## Assets
@@ -19,11 +19,11 @@ the bridge.
 ## Trust boundaries
 
 ```text
-ChatGPT ──(data only: publish.zip)──► user's share tap ──► iOS Shortcut
+ChatGPT ──(data only: <key>-push.zip)──► user's share tap ──► iOS Shortcut
    ──HTTPS over Tailscale──► Tailscale Serve ──HTTP loopback──► bridge ──► GitHub
 ```
 
-Everything inside `publish.zip` is **untrusted input**: repository, branch,
+Everything inside the push ZIP is **untrusted input**: repository, branch,
 base SHA, commit message and patch are validated against server
 configuration, and the patch is applied only in an isolated worktree.
 
@@ -56,8 +56,8 @@ configuration, and the patch is applied only in an isolated worktree.
   remote names. Git runs via fixed argument lists (`shell=False`) with values
   that are either server configuration or validated full-length hex SHAs.
 - Pull requests: with `pull_request.base` configured, the bridge only lists
-  open pull requests and opens one from the published branch into the
-  configured base. It never merges, closes, edits or comments. The token's
+  open pull requests and opens one from the working branch into the
+  integration branch. It never merges, closes, edits or comments. The token's
   *Pull requests* permission would technically allow merging through the API;
   the bridge contains no code path that does so.
 - Pushes use a plain refspec (`<sha>:refs/heads/<branch>`): no `+`, no
@@ -95,9 +95,11 @@ configuration, and the patch is applied only in an isolated worktree.
 **Snapshots**
 
 - Built from Git objects of a single commit, never a working tree.
-- Archive format (default): one ZIP replaced in a single write, so readers
-  never see a mix of commits. Files format: `snapshot.json` is marked
-  `updating` before files change and written `complete` last.
+- Each refresh builds the integration snapshot and the working overlay from
+  one resolved pair of commits; the snapshot pins the overlay's SHA-256, so a
+  reader can never accept artifacts from different generations.
+- Only the integration and working branches are ever fetched; pushes can
+  only target the working branch, never the integration branch.
 - Drive scope `drive.file`: the bridge cannot read or change any file it did
   not create. Removed files go to the Drive trash (recoverable).
 - Only text files are exported; binaries, symlinks and oversized files are
@@ -124,7 +126,7 @@ configuration, and the patch is applied only in an isolated worktree.
    dedicated user. The default configuration runs none.
 3. **Rewind race.** If another writer force-pushes the branch *backwards* to
    an ancestor of `expected_base_sha` between the bridge's fetch and push, a
-   normal fast-forward push succeeds and re-publishes the removed commits.
+   normal fast-forward push succeeds and re-pushes the removed commits.
    Closing this requires `--force-with-lease`, which the design forbids.
 4. **Bearer token on the phone.** Shortcuts sync through iCloud; the token is
    as safe as your Apple account. Rotate with `git-bridge init-token --force`

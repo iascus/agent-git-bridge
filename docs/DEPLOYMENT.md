@@ -91,7 +91,7 @@ powershell -ExecutionPolicy Bypass -File deploy\windows\install-task.ps1
 The task runs `pythonw -m git_bridge serve` hidden at logon under your
 account (no administrator rights), restarts it on failure, and logs to
 `%LOCALAPPDATA%\agent-git-bridge\service.log`. It only runs while you are
-logged in; the PC must be on and logged in to publish from the phone.
+logged in; the PC must be on and logged in to push from the phone.
 
 Operate:
 

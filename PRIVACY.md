@@ -9,7 +9,7 @@ user accounts, and is not a commercial service.
 ## What the app does
 
 Git Bridge copies files from the operator's own GitHub repositories into the
-operator's own Google Drive, and publishes Git changes that the operator
+operator's own Google Drive, and pushes Git changes that the operator
 explicitly approves back to those repositories.
 
 ## Google user data accessed
@@ -26,8 +26,8 @@ calendar, profile information or any other Google service.
 ## How the data is used
 
 - The app creates, updates and deletes the files and folders it exported
-  (copies of repository files and a `snapshot.json` manifest) so that they
-  match a specific Git commit.
+  (a ZIP snapshot of repository files and a text diff) so that they
+  match specific Git commits.
 - Data is used solely to provide this export. It is not used for
   advertising, profiling, analytics, or training machine-learning models,
   and it is not sold.
