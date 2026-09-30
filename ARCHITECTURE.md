@@ -192,6 +192,34 @@ by a fingerprint and not re-uploaded.
   metadata; the Drive state is self-describing and a fresh process needs no
   local index.
 
+## Rebase after a squash merge
+
+PRs are squash-merged: `main` gains one new commit S with the PR's changes,
+while the working branch still carries the original commits. Without a
+rebase, the next PR re-lists the merged work (GitHub diffs against the old
+merge base) and history accumulates.
+
+```text
+before:  main ──●                      design-docs: ●──C1──C2──C3 (=P, PR head)
+merge:   main ──●──S  (S = C1+C2+C3)   design-docs: ●──C1──C2──C3──C4
+Refresh: main ──●──S                   design-docs: ●──S──C4'   (rebase --onto S P)
+```
+
+The bridge is not notified of merges (it is not reachable from GitHub).
+Instead, **Refresh** checks the latest merged PR itself and, if needed and
+enabled (`rebase_after_squash_merge`), rebases only the post-merge commits
+onto the integration head, verifies the tree against `git merge-tree`, and
+updates the working branch with a **lease-guarded force push** (the only
+history rewrite the bridge performs, only for the working branch). A **push**
+never rebases; it only warns while a rebase is pending. Conflicts change
+nothing and are reported.
+
+```text
+merge PR on GitHub  ─►  (bridge not notified; Drive still shows the old state)
+tap Refresh         ─►  rebase design-docs if needed ─► export new generation
+push (any time)     ─►  commit + normal push ─► plain refresh (+ warning if pending)
+```
+
 ## Components
 
 | Module | Responsibility |
@@ -313,9 +341,13 @@ prefer validators that only inspect files. See `SECURITY.md`.
    together by SHA-256; the overlay is a tree diff between manifest-selected
    trees, so reconstruction is exact whatever the history.
 8. **Single process, per-repository locks**; `serve` stops earlier instances.
+9. **Rebase after squash merge, on Refresh only**, lease-guarded, verified
+   against `git merge-tree`, working branch only. Pushes never rewrite history.
 
 ## Known limitations
 
+- The post-merge rebase rewrites the working branch; local checkouts must
+  `git pull --rebase` (or reset) afterwards.
 - **Rewind race**: a force-push moving the working branch *backwards* to an
   ancestor of `expected_base_sha` between fetch and push would let a normal
   fast-forward push re-publish the dropped commits (closing it needs

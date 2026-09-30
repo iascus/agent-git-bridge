@@ -127,6 +127,11 @@ class RepositoryConfig(_Strict):
     validation: list[ValidationCommand] = Field(default_factory=list)
     export: ExportConfig | None = None
     pull_request: PullRequestConfig | None = None
+    # After a pull request working -> integration was squash-merged, a
+    # refresh rebases the working branch onto the integration branch (only
+    # the commits made after the merge) and updates it with a lease-guarded
+    # force push. Needs the "Pull requests: Read" token permission.
+    rebase_after_squash_merge: bool = False
 
     @field_validator("github_repo")
     @classmethod

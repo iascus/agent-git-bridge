@@ -212,6 +212,56 @@ integration if none is open, then refreshes from the heads as they are now
 step are reported (`pull_request.state: "failed"`, `snapshot_refresh:
 "failed"`) and never turn `git_push: "success"` into a failure.
 
+A push **never rebases**. If the working branch still contains a PR that
+was squash-merged into the integration branch, the push response carries
+`"rebase": {"state": "needed", "pull_request": 47, …}` and its `message`
+ends with `WARNING: design-docs still contains squash-merged PR #47; run
+Refresh Git Snapshot to rebase it.`
+
+### Rebase after a squash merge (Refresh)
+
+With `rebase_after_squash_merge: true`, a refresh first checks the latest
+**merged** PR working → integration (GitHub API). If its head commit P is
+still in the working branch's history, is *not* in the integration branch's
+history (i.e. it was squash-merged), and its squash commit is in the
+integration branch, the refresh:
+
+1. rebases only the commits after P onto the integration head
+   (`git rebase --onto <integration> P`) in a temporary worktree; with no
+   post-merge commits the working branch simply becomes the integration head;
+2. requires the rebased tree to equal `git merge-tree` of the two heads (so
+   no content can be lost or reverted);
+3. updates the working branch with `--force-with-lease=<branch>:<old head>`
+   (never the integration branch);
+4. exports the new generation.
+
+A conflict or any failure changes nothing; the refresh still exports and
+reports it. The refresh response gains:
+
+```json
+"rebase": {
+  "state": "rebased",
+  "pull_request": 47,
+  "merged_head": "e586352835…",
+  "old_commit": "5751017631…",
+  "new_commit": "9c1d…",
+  "replayed_commits": 1,
+  "conflicts": [],
+  "error": null
+}
+```
+
+| `rebase.state` | Meaning | `message` prefix |
+|---|---|---|
+| `not_needed` | nothing to do | (none) |
+| `rebased` | working branch rewritten onto the integration head | `Rebased design-docs onto main after PR #47 (1 commit(s) replayed).` |
+| `needed` | pending, but rebasing is disabled for the repository | `WARNING: … rebasing is disabled …` |
+| `conflict` | would conflict; nothing changed | `WARNING: rebasing design-docs after PR #47 conflicts (files); … rebase it manually.` |
+| `failed` | GitHub lookup, verification or lease push failed; nothing changed | `WARNING: rebase of design-docs failed: …` |
+
+After a rebase, local checkouts of the working branch (e.g. VS Code) must be
+updated with `git pull --rebase` or reset to `origin/<working branch>`.
+
 Refresh response (abridged):
 
 ```json
@@ -224,6 +274,7 @@ Refresh response (abridged):
   "generation_id": "…", "uploaded": true,
   "snapshot_name": "rot3k-snapshot.zip", "file_count": 1430,
   "working_diff": {"filename": "rot3k-working.diff", "sha256": "…", "bytes": 18234, "empty": false, "files_changed": 3, "insertions": 120, "deletions": 14},
+  "rebase": {"state": "not_needed", "…": "…"},
   "message": "iascus/rt3k: main 3e7e51c0… (1430 file(s)) + design-docs 237852e3… (overlay 3 file(s) +120 -14); uploaded."
 }
 ```

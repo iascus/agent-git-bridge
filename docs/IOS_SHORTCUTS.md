@@ -107,6 +107,15 @@ from VS Code), or after a push reported `snapshot_refresh: failed`.
 A refresh uploads one ZIP and one diff (seconds for a few MB) and is skipped
 entirely when neither branch changed.
 
+**After squash-merging a PR on GitHub, tap Refresh Git Snapshot** (the bridge
+is not notified of merges). If the repository has
+`rebase_after_squash_merge: true`, the refresh first rebases the working
+branch onto the integration branch; the message then starts with
+`Rebased design-docs onto main after PR #47 …`, or with `WARNING: …` if it
+could not (nothing is changed in that case). A push never rebases; its
+message ends with a warning while a rebase is pending. No Shortcut changes
+are needed for this.
+
 ## End-to-end test
 
 1. In ChatGPT, ask for a trivial change (e.g. fix a typo in a Markdown file)

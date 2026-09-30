@@ -76,6 +76,12 @@ repositories:
     pull_request:
       draft: false
 
+    # After the PR working -> integration is squash-merged, Refresh rebases the
+    # working branch onto the integration branch (only commits made after the
+    # merge) and updates it with a lease-guarded force push. A push never
+    # rebases; it warns while a rebase is pending.
+    rebase_after_squash_merge: true
+
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
     local_path: /var/lib/git-bridge/repos/cyberpunk-tactics
@@ -87,3 +93,4 @@ repositories:
       drive_root: ChatGPT/cyberpunk-tactics
       manifest: docs/design/MANIFEST.md
     pull_request: {}
+    rebase_after_squash_merge: true

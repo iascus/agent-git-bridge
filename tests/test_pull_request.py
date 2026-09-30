@@ -30,6 +30,9 @@ class FakeGitHub:
                 return pr
         return None
 
+    def latest_merged_pull_request(self, repo, head, base):
+        return None
+
     def create_pull_request(self, repo, head, base, title, body, draft):
         self.calls.append(("create", repo, head, base, title, draft))
         if self.fail == "create":
@@ -126,6 +129,7 @@ def test_real_client_only_for_github_remotes(tmp_path):
 
 
 def test_pull_request_targets_configured_integration_branch(prenv: GitEnv):
+    prenv.set_branch("trunk", prenv.head("main"))
     prenv.with_repo_config(integration_branch="trunk")
     _push(prenv)
     assert prenv.github.calls[0] == ("find", "iascus/rot3k", BRANCH, "trunk")
@@ -174,3 +178,21 @@ def test_client_error_explains_missing_permission_without_leaking_token(monkeypa
         GitHubClient(lambda: "github_pat_SECRET").find_open_pull_request("iascus/rt3k", "design-docs", "poc1")
     assert "Pull requests: Read and write" in exc.value.message
     assert "SECRET" not in exc.value.message
+
+
+def test_client_latest_merged_pull_request(monkeypatch):
+    sent = []
+    prs = [
+        {"number": 1, "merged_at": None},
+        {"number": 2, "merged_at": "2026-09-01T00:00:00Z"},
+        {"number": 3, "merged_at": "2026-09-20T00:00:00Z"},
+    ]
+
+    def fake_urlopen(req, timeout):
+        sent.append(req)
+        return _Resp(json.dumps(prs).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    found = GitHubClient(lambda: "t").latest_merged_pull_request("iascus/rt3k", "design-docs", "main")
+    assert found["number"] == 3
+    assert "state=closed" in sent[0].full_url and "head=iascus%3Adesign-docs" in sent[0].full_url and "base=main" in sent[0].full_url

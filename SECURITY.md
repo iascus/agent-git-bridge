@@ -60,6 +60,13 @@ configuration, and the patch is applied only in an isolated worktree.
   integration branch. It never merges, closes, edits or comments. The token's
   *Pull requests* permission would technically allow merging through the API;
   the bridge contains no code path that does so.
+- **One exception to "no force push"**: with `rebase_after_squash_merge`,
+  Refresh may rewrite the **working branch** after its PR was squash-merged,
+  using `--force-with-lease=<branch>:<exact old head>` (a compare-and-swap:
+  anything pushed meanwhile is never overwritten), only after the rebased
+  tree was verified equal to `git merge-tree` of the two heads. The
+  integration branch can never be rewritten (enforced in code), and a push
+  never triggers it.
 - Pushes use a plain refspec (`<sha>:refs/heads/<branch>`): no `+`, no
   `--force`, no `--force-with-lease`, no deletions, no tags, no ref rewriting.
 - Optimistic concurrency: the branch head must equal `expected_base_sha`

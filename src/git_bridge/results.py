@@ -41,6 +41,41 @@ class PullRequestInfo(BaseModel):
     error: str | None = None
 
 
+class RebaseInfo(BaseModel):
+    """Working branch vs. the latest squash-merged PR into the integration branch.
+
+    state:
+      not_needed  no squash-merged PR is still contained in the working branch
+      needed      one is (push, status, or rebasing disabled): warn only
+      rebased     refresh rebased the working branch onto the integration branch
+      conflict    the rebase would conflict; nothing was changed
+      failed      detection or rebase failed; nothing was changed
+    """
+
+    state: Literal["not_needed", "needed", "rebased", "conflict", "failed"]
+    pull_request: int | None = None
+    merged_head: str | None = None
+    old_commit: str | None = None
+    new_commit: str | None = None
+    replayed_commits: int | None = None
+    conflicts: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+    def warning(self, working: str, integration: str, *, on_push: bool = False) -> str:
+        pr = f"PR #{self.pull_request}" if self.pull_request else "a merged PR"
+        if self.state == "rebased":
+            return f"Rebased {working} onto {integration} after {pr} ({self.replayed_commits} commit(s) replayed)."
+        if self.state == "needed":
+            action = "run Refresh Git Snapshot to rebase it" if on_push else "rebasing is disabled for this repository"
+            return f"WARNING: {working} still contains squash-merged {pr}; {action}."
+        if self.state == "conflict":
+            files = ", ".join(self.conflicts[:5]) + (" …" if len(self.conflicts) > 5 else "")
+            return f"WARNING: rebasing {working} after {pr} conflicts ({files}); {working} unchanged, rebase it manually."
+        if self.state == "failed":
+            return f"WARNING: rebase of {working} failed: {self.error}; {working} unchanged."
+        return ""
+
+
 class PushOutcome(BaseModel):
     ok: bool = False
     operation: Literal["validate", "push"]
@@ -59,11 +94,15 @@ class PushOutcome(BaseModel):
     git_push: Literal["success", "failed", "skipped"] = "skipped"
     # Pull request working -> integration branch (if configured).
     pull_request: PullRequestInfo | None = None
+    # Whether the working branch still needs a rebase after a squash merge
+    # (a push never rebases; it only warns).
+    rebase: RebaseInfo | None = None
     # Drive refresh after a successful push. A failure here never changes
     # git_push; retry with POST /repos/{repo}/refresh.
     snapshot_refresh: Literal["success", "failed", "skipped", "not_configured"] = "skipped"
     snapshot_generation_id: str | None = None
     snapshot_error: str | None = None
+    rebase_base: str | None = Field(default=None, exclude=True)  # internal: integration branch name
     error: ErrorInfo | None = None
     # One human-readable line, e.g. for display in an iOS Shortcut.
     message: str = ""
@@ -92,6 +131,10 @@ class PushOutcome(BaseModel):
                 self.message += " Drive snapshot refresh FAILED; run Refresh Git Snapshot."
             elif self.snapshot_refresh == "success":
                 self.message += " Drive snapshot updated."
+            if self.rebase is not None and self.rebase.state != "not_needed":
+                self.message += " " + self.rebase.warning(
+                    self.branch or "working branch", self.rebase_base or "integration branch", on_push=True
+                )
         return self
 
 
@@ -124,6 +167,7 @@ class RepositoryStatus(BaseModel):
     merge_base_commit: str | None = None
     working_ahead_by: int | None = None
     working_behind_by: int | None = None
+    rebase: RebaseInfo | None = None
     snapshot: SnapshotInfo | None = None
 
 
@@ -157,12 +201,16 @@ class RefreshOutcome(BaseModel):
     file_count: int = 0
     not_exported: int = 0
     working_diff: WorkingDiffInfo | None = None
+    rebase: RebaseInfo | None = None
     error: ErrorInfo | None = None
     message: str = ""
 
     def summarise(self) -> "RefreshOutcome":
+        prefix = ""
+        if self.rebase is not None and self.rebase.state != "not_needed":
+            prefix = self.rebase.warning(self.working_branch, self.integration_branch) + " "
         if self.error is not None:
-            self.message = f"Snapshot refresh failed ({self.error.code}): {self.error.message}"
+            self.message = f"{prefix}Snapshot refresh failed ({self.error.code}): {self.error.message}"
             return self
         diff = self.working_diff
         overlay = (
@@ -170,7 +218,7 @@ class RefreshOutcome(BaseModel):
             if diff is None or diff.empty
             else f"overlay {diff.files_changed} file(s) +{diff.insertions} -{diff.deletions}"
         )
-        self.message = (
+        self.message = prefix + (
             f"{self.repository}: {self.integration_branch} {(self.integration_commit or '')[:12]} "
             f"({self.file_count} file(s)) + {self.working_branch} {(self.working_commit or '')[:12]} "
             f"({overlay}); {'uploaded' if self.uploaded else 'unchanged'}."

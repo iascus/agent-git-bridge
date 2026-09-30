@@ -40,6 +40,8 @@ repositories:
     # After each push, open a PR working -> integration unless one is open.
     pull_request:
       draft: false
+    # Refresh rebases the working branch after its PR was squash-merged.
+    rebase_after_squash_merge: true
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
@@ -51,3 +53,4 @@ repositories:
       drive_root: ChatGPT/cyberpunk-tactics
       manifest: docs/design/MANIFEST.md
     pull_request: {}
+    rebase_after_squash_merge: true

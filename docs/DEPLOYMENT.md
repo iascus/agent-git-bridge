@@ -51,7 +51,8 @@ GitHub → *Settings → Developer settings → Fine-grained tokens → Generate
 - Resource owner: your account. Repository access: **only** the configured
   repositories.
 - Permissions: **Contents: Read and write** (Metadata read-only is implied),
-  and **Pull requests: Read and write** if `pull_request` is configured
+  and **Pull requests: Read and write** if `pull_request` or
+  `rebase_after_squash_merge` is configured
   (existing tokens can be edited: *Edit → Repository permissions*).
   Do **not** grant *Workflows* (prevents changes to `.github/workflows`), or
   administration permissions.

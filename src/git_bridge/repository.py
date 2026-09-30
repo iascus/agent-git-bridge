@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from . import pathglob
-from .artifact import PushArtifact, PushRequest
+from .artifact import OBJECT_ID_RE, PushArtifact, PushRequest
 from .config import RepositoryConfig, Settings, ValidationCommand
 from .errors import (
     BridgeError,
@@ -32,7 +32,7 @@ from .errors import (
     ValidationFailed,
 )
 from .events import EventLog
-from .github import GitHubApi, GitHubClient
+from .github import GitHubApi, GitHubClient, PullRequestError
 from .gitcmd import Git, github_auth_env, minimal_env, tail
 from .results import (
     BranchHead,
@@ -41,6 +41,7 @@ from .results import (
     ErrorInfo,
     PullRequestInfo,
     PushOutcome,
+    RebaseInfo,
     RefreshOutcome,
     RepositoryStatus,
     SnapshotInfo,
@@ -185,6 +186,7 @@ class Repository:
                 status.merge_base_commit, status.working_ahead_by, status.working_behind_by = self._relationship(
                     integration.commit, working.commit
                 )
+                status.rebase = self._rebase_check(integration.commit, working.commit)
         if cfg.export is not None and self.store_factory is not None:
             try:
                 store = self.store_factory(self)
@@ -229,9 +231,14 @@ class Repository:
         except Exception as exc:
             raise SnapshotError(f"cannot open snapshot store: {type(exc).__name__}: {str(exc)[:300]}") from exc
 
-    def refresh(self) -> RefreshOutcome:
+    def refresh(self, *, allow_rebase: bool = True) -> RefreshOutcome:
         """Resolve both branch heads together and export one generation:
-        the integration snapshot and the integration -> working overlay."""
+        the integration snapshot and the integration -> working overlay.
+
+        With ``rebase_after_squash_merge`` and ``allow_rebase``, a working
+        branch that still contains a squash-merged PR is first rebased onto
+        the integration branch. A push refreshes with ``allow_rebase=False``:
+        it only reports whether a rebase is needed."""
         cfg = self.config
         outcome = RefreshOutcome(
             repository=cfg.github_repo,
@@ -245,6 +252,17 @@ class Repository:
             with self.lock:
                 self.ensure_clone()
                 integration, working = self.fetch_heads()
+                outcome.rebase = self._rebase_check(integration, working)
+                if (
+                    allow_rebase
+                    and cfg.rebase_after_squash_merge
+                    and outcome.rebase is not None
+                    and outcome.rebase.state == "needed"
+                ):
+                    self._remove_stale_worktrees()
+                    outcome.rebase = self._rebase_after_merge(integration, working, outcome.rebase)
+                    if outcome.rebase.state == "rebased":
+                        working = outcome.rebase.new_commit
                 gen = build_generation(
                     self.git,
                     integration_commit=integration,
@@ -296,6 +314,8 @@ class Repository:
             ok=outcome.ok,
             error=outcome.error.code if outcome.error else None,
             error_message=outcome.error.message if outcome.error else None,
+            rebase=outcome.rebase.state if outcome.rebase else None,
+            rebase_pr=outcome.rebase.pull_request if outcome.rebase else None,
             files=outcome.file_count,
             overlay_files=outcome.working_diff.files_changed if outcome.working_diff else None,
             duration_ms=int((time.monotonic() - started) * 1000),
@@ -310,10 +330,16 @@ class Repository:
         if not outcome.ok or outcome.new_sha is None:
             return outcome
         outcome.pull_request = self._ensure_pull_request(outcome)
+        outcome.rebase_base = self.config.integration_branch
         if self.config.export is None or self.store_factory is None:
             outcome.snapshot_refresh = "not_configured"
+            try:
+                outcome.rebase = self.rebase_status()
+            except BridgeError as exc:  # informational only; the push has succeeded
+                outcome.rebase = RebaseInfo(state="failed", error=exc.message)
             return outcome.summarise()
-        refreshed = self.refresh()
+        refreshed = self.refresh(allow_rebase=False)  # a push never rewrites history
+        outcome.rebase = refreshed.rebase
         if refreshed.ok:
             outcome.snapshot_refresh = "success"
             outcome.snapshot_generation_id = refreshed.generation_id
@@ -412,6 +438,114 @@ class Repository:
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         return outcome.summarise()
+
+    # ----------------------------------------------------- rebase after merge
+
+    def _is_ancestor(self, ancestor: str, commit: str) -> bool:
+        # Exit 1: not an ancestor; 128: unknown object. Both mean "no".
+        return self.git.run(["merge-base", "--is-ancestor", ancestor, commit], check=False).returncode == 0
+
+    def rebase_status(self) -> RebaseInfo | None:
+        with self.lock:
+            self.ensure_clone()
+            integration, working = self.fetch_heads()
+            return self._rebase_check(integration, working)
+
+    def _rebase_check(self, integration: str, working: str) -> RebaseInfo | None:
+        """Does the working branch still contain the latest squash-merged PR?
+
+        None when the repository has no GitHub API client (nothing to check)."""
+        if self.github is None:
+            if self.config.rebase_after_squash_merge:
+                return RebaseInfo(state="failed", error="no GitHub API client configured")
+            return None
+        cfg = self.config
+        try:
+            merged = self.github.latest_merged_pull_request(cfg.github_repo, cfg.working_branch, cfg.integration_branch)
+        except PullRequestError as exc:
+            return RebaseInfo(state="failed", error=exc.message)
+        except Exception as exc:  # a status check must never break a push or refresh
+            return RebaseInfo(state="failed", error=f"{type(exc).__name__}: {str(exc)[:200]}")
+        if not merged:
+            return RebaseInfo(state="not_needed")
+        head = str((merged.get("head") or {}).get("sha", ""))
+        squash = str(merged.get("merge_commit_sha") or "")
+        info = RebaseInfo(state="not_needed", pull_request=merged.get("number"), merged_head=head or None, old_commit=working)
+        if not OBJECT_ID_RE.match(head) or not OBJECT_ID_RE.match(squash):
+            return info
+        if (
+            self._is_ancestor(head, working)  # merged work is still in the working branch's history,
+            and not self._is_ancestor(head, integration)  # but not in main's (so it was squashed),
+            and self._is_ancestor(squash, integration)  # and the squash commit is in main
+        ):
+            info.state = "needed"
+            info.replayed_commits = int(self.git.text(["rev-list", "--count", f"{head}..{working}"]))
+        return info
+
+    def _rebase_after_merge(self, integration: str, working: str, info: RebaseInfo) -> RebaseInfo:
+        """Replay only the commits made after the merged PR head onto the
+        integration branch, verify, and update the working branch with a
+        lease-guarded force push. Nothing changes unless every step succeeds.
+        Caller holds self.lock."""
+        base = info.merged_head
+        result = info.model_copy()
+        # What a merge would produce: the rebased tree must be identical.
+        merged = self.git.run(["merge-tree", "--write-tree", "--name-only", integration, working], check=False)
+        if merged.returncode != 0:
+            # Output: tree OID, conflicted paths, a blank line, then messages.
+            lines = merged.text.splitlines()[1:]
+            paths = lines[: lines.index("")] if "" in lines else lines
+            result.state = "conflict" if merged.returncode == 1 else "failed"
+            result.conflicts = sorted(set(paths))
+            result.error = None if merged.returncode == 1 else tail(merged.stderr)
+            return result
+        expected_tree = merged.text.splitlines()[0]
+        identity = self.settings.git_identity
+        env = {
+            "GIT_COMMITTER_NAME": identity.name,
+            "GIT_COMMITTER_EMAIL": identity.email,
+            "GIT_EDITOR": "true",
+            "GIT_SEQUENCE_EDITOR": "true",
+        }
+        try:
+            with self._worktree(working) as wt:
+                wt_git = self.git.at(wt)
+                rebased = wt_git.run(
+                    ["rebase", "--no-autosquash", "--no-update-refs", "--empty=drop", "--onto", integration, base],
+                    env=env,
+                    check=False,
+                )
+                if rebased.returncode != 0:
+                    conflicts = wt_git.text(["diff", "--name-only", "--diff-filter=U"]).splitlines()
+                    wt_git.run(["rebase", "--abort"], check=False)
+                    result.state = "conflict" if conflicts else "failed"
+                    result.conflicts = conflicts
+                    result.error = None if conflicts else tail(rebased.stderr)
+                    return result
+                new_commit = wt_git.text(["rev-parse", "HEAD"])
+            if self.git.text(["rev-parse", f"{new_commit}^{{tree}}"]) != expected_tree:
+                result.state = "failed"
+                result.error = "rebased tree differs from the merge result; not pushed"
+                return result
+            self._push(new_commit, self.config.working_branch, lease=working)
+            self._refresh_tracking_ref(self.config.working_branch)
+        except BridgeError as exc:
+            result.state = "failed"
+            result.error = exc.message
+            return result
+        result.state = "rebased"
+        result.new_commit = new_commit
+        result.replayed_commits = int(self.git.text(["rev-list", "--count", f"{integration}..{new_commit}"]))
+        self.events.emit(
+            "rebase",
+            repo=self.key,
+            pull_request=result.pull_request,
+            old_commit=working,
+            new_commit=new_commit,
+            onto=integration,
+            replayed=result.replayed_commits,
+        )
+        return result
 
     def _ensure_pull_request(self, outcome: PushOutcome) -> PullRequestInfo | None:
         """Open a PR from the working branch into the integration branch unless
@@ -581,12 +715,17 @@ class Repository:
         body = normalise_commit_message(message).encode("utf-8")
         return self.git.text(["commit-tree", tree, "-p", parent, "-F", "-"], input=body, env=env)
 
-    def _push(self, sha: str, branch: str) -> None:
-        # Plain refspec: no leading '+', no --force, no --force-with-lease.
-        # A non-fast-forward is rejected by Git and reported, never retried.
+    def _push(self, sha: str, branch: str, *, lease: str | None = None) -> None:
+        # Normal pushes: plain refspec, no '+', no --force. A non-fast-forward
+        # is rejected by Git and reported, never retried.
+        # Only the post-merge rebase passes ``lease``: the working branch is
+        # replaced only if it still points at exactly that commit.
         target = f"refs/heads/{branch}"
+        if lease is not None and branch != self.config.working_branch:
+            raise NotAllowed("only the working branch may be rewritten")
+        options = [f"--force-with-lease={target}:{lease}"] if lease is not None else []
         result = self.git.run(
-            ["push", "--porcelain", self.config.remote, f"{sha}:{target}"],
+            ["push", "--porcelain", *options, self.config.remote, f"{sha}:{target}"],
             env=self._network_env(),
             check=False,
         )
@@ -596,7 +735,8 @@ class Repository:
             if len(parts) >= 3 and parts[1].endswith(":" + target):
                 status_line = parts
                 break
-        if result.returncode == 0 and status_line and status_line[0] in (" ", "*"):
+        allowed_flags = (" ", "*", "+") if lease is not None else (" ", "*")
+        if result.returncode == 0 and status_line and status_line[0] in allowed_flags:
             return
         if status_line and status_line[0] == "!":
             summary = status_line[2]
@@ -631,7 +771,11 @@ class Bridge:
             # Pull requests only for real GitHub remotes, with the bridge's own token.
             if github is not None:
                 repo.github = github
-            elif cfg.pull_request is not None and cfg.remote_url is None and settings.github_token_file is not None:
+            elif (
+                (cfg.pull_request is not None or cfg.rebase_after_squash_merge)
+                and cfg.remote_url is None
+                and settings.github_token_file is not None
+            ):
                 repo.github = GitHubClient(repo.github_token)
             self._repositories[key] = repo
 

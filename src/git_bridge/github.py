@@ -1,4 +1,5 @@
-"""Minimal GitHub REST client: find or open a pull request. Nothing else.
+"""Minimal GitHub REST client: find or open pull requests, and look up the
+latest merged one. Nothing else.
 
 The bridge never merges, closes, edits or comments on pull requests.
 """
@@ -26,6 +27,7 @@ class GitHubApi(Protocol):
     def create_pull_request(
         self, repo: str, head: str, base: str, title: str, body: str, draft: bool
     ) -> dict[str, Any]: ...
+    def latest_merged_pull_request(self, repo: str, head: str, base: str) -> dict[str, Any] | None: ...
 
 
 class GitHubClient:
@@ -69,6 +71,14 @@ class GitHubClient:
         query = urllib.parse.urlencode({"state": "open", "head": f"{owner}:{head}", "base": base, "per_page": 5})
         found = self._request("GET", f"/repos/{repo}/pulls?{query}")
         return found[0] if found else None
+
+    def latest_merged_pull_request(self, repo: str, head: str, base: str) -> dict[str, Any] | None:
+        owner = repo.split("/", 1)[0]
+        query = urllib.parse.urlencode(
+            {"state": "closed", "head": f"{owner}:{head}", "base": base, "sort": "updated", "direction": "desc", "per_page": 30}
+        )
+        merged = [pr for pr in self._request("GET", f"/repos/{repo}/pulls?{query}") if pr.get("merged_at")]
+        return max(merged, key=lambda pr: pr["merged_at"]) if merged else None
 
     def create_pull_request(self, repo: str, head: str, base: str, title: str, body: str, draft: bool) -> dict[str, Any]:
         return self._request(
