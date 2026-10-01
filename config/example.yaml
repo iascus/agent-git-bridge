@@ -19,9 +19,9 @@ google:
   client_secrets_file: /etc/git-bridge/google-client.json
   token_file: /var/lib/git-bridge/google-token.json
 
-git_identity:
-  name: Git Bridge
-  email: git-bridge@users.noreply.github.com
+git_identity:                    # author and committer of every bridge commit
+  name: iascus
+  email: 127579634+iascus@users.noreply.github.com
 
 limits:
   max_archive_bytes: 5242880            # 5 MiB compressed upload

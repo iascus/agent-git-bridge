@@ -350,3 +350,16 @@ def test_git_is_not_run_through_a_shell():
         assert "shell=True," not in source and "shell=True)" not in source
         assert "os.system" not in source
     assert os.devnull in gitcmd.minimal_env()["GIT_CONFIG_GLOBAL"]
+
+
+def test_configured_identity_is_author_and_committer(gitenv: GitEnv):
+    from git_bridge.config import GitIdentity
+
+    gitenv.settings = gitenv.settings.model_copy(
+        update={"git_identity": GitIdentity(name="iascus", email="127579634+iascus@users.noreply.github.com")}
+    )
+    base, patch = gitenv.make_patch({"MANIFEST.md": "authored\n"})
+    out = gitenv.repo.push(gitenv.artifact(patch, base))
+    assert out.ok
+    who = "iascus <127579634+iascus@users.noreply.github.com>"
+    assert git(gitenv.origin, "log", "-1", "--format=%an <%ae>|%cn <%ce>", out.new_sha) == f"{who}|{who}"

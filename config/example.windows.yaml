@@ -11,9 +11,9 @@ github_token_file: C:/Users/YOU/.config/agent-git-bridge/github-token.txt
 git_extra_config:
   - http.sslBackend=schannel
 
-git_identity:
-  name: Git Bridge
-  email: git-bridge@users.noreply.github.com
+git_identity:                    # author and committer of every bridge commit
+  name: iascus
+  email: 127579634+iascus@users.noreply.github.com
 
 server:
   host: 127.0.0.1          # loopback only; Tailscale Serve provides HTTPS
