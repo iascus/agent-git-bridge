@@ -4,7 +4,8 @@ Two data formats cross the trust boundary:
 
 - **Pull**: per project, a refresh *generation* the bridge writes to Google
   Drive: the integration-branch snapshot and the integration → working
-  overlay (format version 2).
+  overlay (format version 2, or 3 if the project declares [project artifact
+  roots](#project-artifact-roots)).
 - **Push**: the ZIP ChatGPT produces to advance the working branch.
 
 Terminology: **Push** advances the working branch. **Integration** is the
@@ -36,6 +37,11 @@ manifest: sel(M) from M's manifest, sel(D) from D's. Listed files that are
 missing, binary, symlinks or too large are excluded and reported in
 `not_exported` (reasons `missing`, `binary`, `symlink`, `too_large`,
 `unsupported_path`).
+
+The same manifest may also declare **project artifact roots**: repository
+directories whose every tracked Git file is exported byte-for-byte, text or
+binary, without listing each file. See [Project artifact
+roots](#project-artifact-roots).
 
 ### `snapshot.json` (format_version 2)
 
@@ -90,7 +96,7 @@ missing, binary, symlinks or too large are excluded and reported in
 
 ### `<key>-working.diff`
 
-A deterministic text patch (`git diff-tree -p -M --full-index`, prefixes
+A deterministic patch (`git diff-tree -p -M --full-index --binary`, prefixes
 `a/` and `b/`) from the tree of sel(M) to the tree of sel(D), preceded by a
 comment header that `git apply` ignores:
 
@@ -111,8 +117,55 @@ It is the exact **tree** difference, not the working branch's commits and not
 has not been rebased, the overlay legitimately shows main-only changes being
 reverted. After an external rebase, the next refresh reflects the new heads.
 
+`--binary` makes a changed binary file (see [Project artifact
+roots](#project-artifact-roots)) appear as a literal/base85 **GIT binary
+patch** block instead of "Binary files differ"; `git apply` reconstructs it
+the same way as a text hunk, with no extra flag needed. It is a byte-for-byte
+no-op on an all-text diff, so format-2 projects are unaffected.
+
 **Invariant:** unzipping the snapshot and applying the overlay reproduces
-sel(D) byte for byte (verified by `working_diff.working_files`).
+sel(D) byte for byte (verified by `working_diff.working_files`), whether
+sel(D) contains binary files or not.
+
+### Project artifact roots
+
+A manifest may declare a second, optional block for repository directories
+whose every tracked Git file — text or binary — is exported as-is, without
+being listed individually:
+
+```text
+<!-- PROJECT_ARTIFACT_ROOTS_BEGIN -->
+```yaml
+project_artifact_roots:
+  - assets/gfx/
+```
+<!-- PROJECT_ARTIFACT_ROOTS_END -->
+```
+
+Each root is read from the same commit as `PROJECT_SOURCE_FILES`, is
+repository-relative, and is rejected (export fails closed) if it is absolute,
+contains `..`, or otherwise fails the same traversal check applied to every
+listed source path. A root matching no tracked files (or the block being
+absent) is not an error. Files under a root are still subject to
+`max_file_bytes` / `max_total_bytes` and are excluded (as `symlink` or
+`too_large`, reported in `not_exported`) under the same rules as listed
+source files — **except** the `binary` exclusion, which never applies to
+artifact-root files. A path also listed in `PROJECT_SOURCE_FILES` that falls
+under a root is treated as an artifact (included whether text or binary).
+
+Declaring at least one artifact root (in either branch's manifest) raises
+`format_version` to **3** and adds:
+
+| Field | Meaning |
+|---|---|
+| `artifact_roots` | M's own declared roots (sorted), top level. |
+| `files[path].origin` | `"source"` or `"artifact_root"`, present on every entry. |
+| `working_diff.working_artifact_roots` | D's own declared roots (sorted). |
+| `working_diff.working_artifact_files` | Paths of `working_diff.working_files` that are artifacts. |
+
+A format-2 project (no manifest ever declares a root) is byte-for-byte
+unaffected by any of this: the diff command's `--binary` flag is already a
+no-op on text-only trees, and none of the fields above are added.
 
 ### Reader procedure
 
@@ -169,9 +222,15 @@ encrypted.
 | `created_at`, `generator` | Optional, informational. |
 
 Unknown fields and duplicate keys are rejected. `changes.patch` is a `git
-diff` from D (paths `a/…`, `b/…`), text files only; symlinks, submodules,
-binary patches and `denied_paths` are rejected; added lines must pass `git
-diff --check`.
+diff` from D (paths `a/…`, `b/…`), produced with `--binary` so it may contain
+binary (added/modified/deleted) files alongside text changes in one patch —
+`git apply` applies both from the same invocation, so no second artifact
+member or protocol version is needed. Symlinks, submodules and
+`denied_paths` are still rejected regardless of file content; text additions
+must still pass `git diff --check` (binary content has nothing to check).
+`request.json`'s shape is unchanged: a client that never produces binary
+changes needs no changes at all, and nothing about the request format
+signals whether a given patch happens to contain any.
 
 ### Limits (defaults)
 
@@ -312,12 +371,14 @@ Paste into the ChatGPT project instructions (adjust names):
 > not try to merge.
 >
 > **Push.** When I ask to push, produce `<key>-push.zip` containing exactly
-> `changes.patch` (unified `git diff` D → H, paths `a/` and `b/`, text files
-> only, no trailing whitespace on added lines) and `request.json` with
-> `format_version` 1, `repository` (from `snapshot.json`), `branch` =
-> `working_branch`, `expected_base_sha` = `working_commit`, `patch_sha256`
-> (SHA-256 hex of the exact `changes.patch` bytes), `commit_message`. Build it
-> with Python's `zipfile` and give me the file. I push it from the share sheet.
+> `changes.patch` (`git diff --binary` D → H, paths `a/` and `b/`, no trailing
+> whitespace on added text lines; binary files under an artifact root are
+> included as Git binary patch hunks, same file, same member) and
+> `request.json` with `format_version` 1, `repository` (from `snapshot.json`),
+> `branch` = `working_branch`, `expected_base_sha` = `working_commit`,
+> `patch_sha256` (SHA-256 hex of the exact `changes.patch` bytes),
+> `commit_message`. Build it with Python's `zipfile` and give me the file. I
+> push it from the share sheet.
 
 Example generator:
 
@@ -352,3 +413,23 @@ with zipfile.ZipFile(f"{snapshot['project_key']}-push.zip", "w", zipfile.ZIP_DEF
 - Push: endpoint `/push` (the old `/publish` path still works for now);
   response field `git_push` replaces `git_publish`; `expected_base_sha` is
   the `working_commit`.
+
+## Migrating to format 3 (project artifact roots)
+
+Nothing to do for a project that never adds a `PROJECT_ARTIFACT_ROOTS` block:
+`snapshot.json` stays `format_version: 2`, byte-for-byte as before.
+
+To opt in, a consuming repository adds the block to its own manifest (both
+branches, or the next commit that reaches each branch) — no bridge
+configuration change, no server restart. The next refresh then produces
+`format_version: 3` with the extra fields listed in [Project artifact
+roots](#project-artifact-roots). Existing readers that only look at fields
+present in format 2 keep working unmodified, since nothing already present is
+removed or repurposed; a reader that wants byte-identical binary files needs
+to treat the overlay's binary hunks the same way it already treats text
+hunks (plain `git apply`, no new flag).
+
+**iOS Shortcut: no change required.** Both Shortcuts (`Push Git Patch`,
+`Refresh Git Snapshot`) already forward the ZIP body unmodified and never
+inspect `changes.patch` or `working.diff` content; a push containing binary
+files is indistinguishable, at the Shortcut layer, from one that does not.

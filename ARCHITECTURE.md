@@ -146,6 +146,14 @@ missing, binary, symlinks or larger than `max_file_bytes` are excluded on that
 side and reported under `not_exported`. Implementation and build files not in
 the manifest are never exported.
 
+The same manifest may declare `PROJECT_ARTIFACT_ROOTS`: repository
+directories whose every tracked Git file — whatever its content — is added to
+the selection without being listed, stored and patched byte-for-byte (the
+`binary` exclusion never applies to them; `symlink` and `too_large` still
+do). This is how generated binary assets (e.g. `assets/gfx/`) join the same
+snapshot/overlay/push pipeline as text source, with no bridge-specific code
+per project — see [docs/PROTOCOL.md](docs/PROTOCOL.md#project-artifact-roots).
+
 ### The overlay is a tree diff
 
 The overlay is **not** the working branch's commits and **not** "changes since
@@ -228,8 +236,8 @@ push (any time)     ─►  commit + normal push ─► plain refresh (+ warning
 | `git_bridge.gitcmd` | The only place that executes Git: fixed argv, no shell, isolated from user/system config, timeouts, credentials via environment for network operations only. |
 | `git_bridge.artifact` | Parse and validate the push ZIP in memory (limits, exact member names, checksum, strict `request.json`). |
 | `git_bridge.repository` | Per-repository clone, fetch, status, isolated worktrees, validate/push pipeline, refresh, push-then-refresh, PRs. `Bridge` is the registry. |
-| `git_bridge.snapshot` | Manifest-based selection, synthetic trees, overlay, `snapshot.json` (format 2), deterministic ZIP, ordered export. |
-| `git_bridge.manifest` | Parse the `PROJECT_SOURCE_FILES` block. |
+| `git_bridge.snapshot` | Manifest-based selection (source files + artifact roots), synthetic trees, binary-capable overlay, `snapshot.json` (format 2, or 3 with artifact roots), deterministic ZIP, ordered export. |
+| `git_bridge.manifest` | Parse the `PROJECT_SOURCE_FILES` and `PROJECT_ARTIFACT_ROOTS` blocks. |
 | `git_bridge.store` / `drive` | `SnapshotStore` (two artifacts per project): local directory and Google Drive; OAuth. |
 | `git_bridge.github` | Find/open pull requests (never merge). |
 | `git_bridge.api` | FastAPI: health, status, refresh, validate-patch, push. |
@@ -296,10 +304,10 @@ repository + branch  ──► 403 unless repository matches and branch == worki
 fetch working branch
 head == expected_base_sha ? ──► 409 remote_changed
 git worktree add --detach <tmp> <expected_base_sha>
-git apply --check --index   ──► 422 patch_does_not_apply
+git apply --check --index   ──► 422 patch_does_not_apply   (binary hunks included, no extra flag)
 git apply --index
-policy on staged diff       ──► 422 (empty, symlink, submodule, binary, denied path)
-git diff --cached --check   ──► 422 validation_failed
+policy on staged diff       ──► 422 (empty, symlink, submodule, denied path)
+git diff --cached --check   ──► 422 validation_failed      (nothing to check in binary content)
 configured validation       ──► 422 validation_failed
 ── validate-patch stops here ──
 git commit-tree (tree captured before validation)
@@ -332,7 +340,9 @@ prefer validators that only inspect files. See `SECURITY.md`.
 
 1. **Bare persistent clone**; pushes use a temporary worktree.
 2. **Built-in `git diff --cached --check`** (the patch is applied with `--index`).
-3. **Staged-diff policy**: no empty patches, symlinks, submodules, binaries, `denied_paths`.
+3. **Staged-diff policy**: no empty patches, symlinks, submodules, `denied_paths`. Binary
+   add/modify/delete is allowed (`git apply` already handles Git binary patches
+   with no extra flag); the policy is about file *mode* and *path*, never content.
 4. **`patch_sha256` is integrity, not authenticity.**
 5. **`request.json` repository must match the endpoint.**
 6. **Full-length SHAs only.**
@@ -343,6 +353,12 @@ prefer validators that only inspect files. See `SECURITY.md`.
 8. **Single process, per-repository locks**; `serve` stops earlier instances.
 9. **Rebase after squash merge, on Refresh only**, lease-guarded, verified
    against `git merge-tree`, working branch only. Pushes never rewrite history.
+10. **Project artifact roots are manifest-driven, like source selection**: a
+    repository opts in by declaring `PROJECT_ARTIFACT_ROOTS` in its own
+    manifest, not by a server-side configuration change, so new projects need
+    no bridge code change. Git's own binary-patch format (`--binary`,
+    `git apply`) carries both text and binary changes through the same
+    overlay and push patch; no second parallel push format was added.
 
 ## Known limitations
 
@@ -354,8 +370,10 @@ prefer validators that only inspect files. See `SECURITY.md`.
   `--force-with-lease`, which is not used by design).
 - Validation commands are not sandboxed by the application.
 - One Uvicorn worker; locks are in-process.
-- Overlay reconstruction covers exported (text) files only; binary changes are
-  invisible to both artifacts by design.
+- A binary file listed individually in `PROJECT_SOURCE_FILES` (not under a
+  declared artifact root) is still excluded (`not_exported: "binary"`) and
+  invisible to both artifacts, by design: artifact roots are the opt-in for
+  binary content, not a blanket change to source-file selection.
 
 ## Deployment
 

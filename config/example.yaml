@@ -91,5 +91,9 @@ repositories:
     export:
       drive_root: ChatGPT/cyberpunk-tactics
       manifest: docs/design/MANIFEST.md
+      # Project artifact roots (e.g. assets/gfx/ for generated GFX) are not
+      # configured here: this repository's own manifest declares them in a
+      # PROJECT_ARTIFACT_ROOTS block, the same way it declares
+      # PROJECT_SOURCE_FILES. See docs/PROTOCOL.md#project-artifact-roots.
     pull_request: {}
     rebase_after_squash_merge: true

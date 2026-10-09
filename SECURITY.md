@@ -81,8 +81,14 @@ configuration, and the patch is applied only in an isolated worktree.
   no encryption, strict JSON (no duplicate keys, no unknown fields).
 - Applied with `git apply --index` in a fresh temporary worktree at the exact
   base commit; Git refuses paths outside the tree or inside `.git`.
-- Rejected after applying: empty patches, symlinks, submodules, binary
-  changes, `denied_paths` (default `.github/**`).
+- Rejected after applying: empty patches, symlinks, submodules, `denied_paths`
+  (default `.github/**`). Binary add/modify/delete is accepted — Git's own
+  binary-patch format (`GIT binary patch`, literal/base85) is applied by the
+  same `git apply --index` call as text hunks, so a malformed binary patch
+  fails the same way a malformed text patch does (`patch_does_not_apply`,
+  nothing committed); it still cannot create a symlink or submodule, or touch
+  a denied path, because that check runs on the resulting tree, not the
+  patch's own claimed content type.
 - The committed tree is captured before validation commands run, so a
   validator cannot alter what is committed.
 
@@ -109,8 +115,15 @@ configuration, and the patch is applied only in an isolated worktree.
   only target the working branch, never the integration branch.
 - Drive scope `drive.file`: the bridge cannot read or change any file it did
   not create. Removed files go to the Drive trash (recoverable).
-- Only text files are exported; binaries, symlinks and oversized files are
-  listed but not uploaded.
+- Only text files listed in `PROJECT_SOURCE_FILES` are exported that way;
+  binaries, symlinks and oversized files are listed but not uploaded.
+- A repository may opt a directory into binary export via its own manifest's
+  `PROJECT_ARTIFACT_ROOTS` (never a bridge-side setting). Each root is
+  validated against the same traversal/absolute-path check as every listed
+  source path (rejecting `..`, absolute paths); only tracked Git blobs under
+  it are read (`git ls-tree`, never the filesystem, so no symlink can be
+  followed to escape the repository); symlinks and oversized files under a
+  root are still excluded, the same as for listed source files.
 
 **Logging**
 
