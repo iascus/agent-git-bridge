@@ -640,15 +640,18 @@ class Repository:
                 raise PatchPolicyViolation("patch touches a denied path", path=path)
 
     def _collect_stats(self, git: Git, base: str, outcome: PushOutcome) -> None:
+        # --numstat reports "-" "-" for binary files; git itself (not our
+        # policy) decides binary vs text, based on content, not file name.
         raw = git.run(["diff", "--cached", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", base])
         changed = []
         for record in raw.stdout.split(b"\0"):
             if not record:
                 continue
             added, deleted, path = record.decode("utf-8").split("\t", 2)
-            if added == "-" or deleted == "-":
-                raise PatchPolicyViolation("binary changes are not supported", path=path)
-            changed.append(ChangedFile(path=path, insertions=int(added), deletions=int(deleted)))
+            binary = added == "-" or deleted == "-"
+            changed.append(
+                ChangedFile(path=path, insertions=0 if binary else int(added), deletions=0 if binary else int(deleted), binary=binary)
+            )
         outcome.changed_files = changed
         outcome.files_changed = len(changed)
         outcome.insertions = sum(c.insertions for c in changed)

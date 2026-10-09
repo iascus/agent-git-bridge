@@ -42,10 +42,16 @@ from .config import ExportConfig
 from .errors import GitError, SnapshotError
 from .events import utc_now
 from .gitcmd import Git
-from .manifest import parse_manifest
+from .manifest import parse_artifact_roots, parse_manifest
 from .store import SNAPSHOT_NAME, SnapshotStore, check_relative_path
 
 FORMAT_VERSION = 2
+# Format 3: at least one branch's manifest declares PROJECT_ARTIFACT_ROOTS.
+# Files under those roots are exported byte-for-byte whether text or binary,
+# and the overlay may contain Git binary patch hunks. The diff command and
+# ZIP layout are otherwise unchanged, and format 2 output is byte-identical
+# to before this existed (--binary is a no-op on an all-text diff).
+FORMAT_VERSION_ARTIFACTS = 3
 _ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 
 READER_NOTES = (
@@ -57,6 +63,15 @@ READER_NOTES = (
     "sha256 (and its '# generation:' header) against working_diff; on mismatch a "
     "refresh is in progress, so fetch both files again. Pushes are made against "
     "D: expected_base_sha = working_commit, changes.patch = D -> your HEAD."
+)
+
+READER_NOTES_ARTIFACTS = (
+    READER_NOTES + " This project also declares project_artifact_roots: files under "
+    "those roots (see artifact_roots) are included whether text or binary and are "
+    "stored/patched byte-for-byte; `files[path].origin` and `working_diff."
+    "working_artifact_files` mark which files came from an artifact root rather "
+    "than the source manifest. The overlay may contain Git binary patch hunks "
+    "(`git apply` reconstructs them the same way as text hunks)."
 )
 
 
@@ -122,13 +137,33 @@ def is_text(content: bytes) -> bool:
 
 @dataclass
 class Selection:
-    """The exported files of one commit, as selected by its own manifest."""
+    """The exported files of one commit, as selected by its own manifest:
+    sel(source) from PROJECT_SOURCE_FILES (text only) plus sel(artifacts)
+    from every tracked file under a PROJECT_ARTIFACT_ROOTS root (text or
+    binary)."""
 
     commit: str
     manifest_blob_sha: str
     files: dict[str, TreeEntry] = field(default_factory=dict)
     contents: dict[str, bytes] = field(default_factory=dict)
     not_exported: dict[str, str] = field(default_factory=dict)  # path -> reason
+    artifact_roots: list[str] = field(default_factory=list)
+    artifact_paths: set[str] = field(default_factory=set)  # subset of files.keys()
+
+
+def _check_candidate(export: ExportConfig, entry: TreeEntry, not_exported: dict[str, str]) -> bool:
+    try:
+        check_relative_path(entry.path)
+    except SnapshotError:
+        not_exported[entry.path] = "unsupported_path"
+        return False
+    if entry.mode == "120000":
+        not_exported[entry.path] = "symlink"
+        return False
+    if entry.size > export.max_file_bytes:
+        not_exported[entry.path] = "too_large"
+        return False
+    return True
 
 
 def select_files(git: Git, commit: str, export: ExportConfig) -> Selection:
@@ -136,9 +171,15 @@ def select_files(git: Git, commit: str, export: ExportConfig) -> Selection:
     manifest_entry = tree.get(export.manifest)
     if manifest_entry is None:
         raise SnapshotError(f"manifest {export.manifest} does not exist at commit {commit[:12]}")
-    listed = parse_manifest(read_blobs(git, [manifest_entry.blob_sha])[manifest_entry.blob_sha], export.manifest)
-    selection = Selection(commit=commit, manifest_blob_sha=manifest_entry.blob_sha)
-    candidates: list[TreeEntry] = []
+    manifest_bytes = read_blobs(git, [manifest_entry.blob_sha])[manifest_entry.blob_sha]
+    listed = parse_manifest(manifest_bytes, export.manifest)
+    artifact_roots = parse_artifact_roots(manifest_bytes, export.manifest)
+    selection = Selection(commit=commit, manifest_blob_sha=manifest_entry.blob_sha, artifact_roots=artifact_roots)
+
+    def _under_root(path: str) -> bool:
+        return any(path.startswith(root) for root in artifact_roots)
+
+    source_candidates: list[TreeEntry] = []
     for path in listed:
         entry = tree.get(path)
         try:
@@ -148,23 +189,38 @@ def select_files(git: Git, commit: str, export: ExportConfig) -> Selection:
             continue
         if entry is None:
             selection.not_exported[path] = "missing"
-        elif entry.mode == "120000":
-            selection.not_exported[path] = "symlink"
-        elif entry.size > export.max_file_bytes:
-            selection.not_exported[path] = "too_large"
-        else:
-            candidates.append(entry)
-    total = sum(e.size for e in candidates)
+        elif _under_root(path):
+            continue  # under an artifact root: handled below, no text filter
+        elif _check_candidate(export, entry, selection.not_exported):
+            source_candidates.append(entry)
+
+    # Every tracked file under a root, whether or not it is also individually
+    # listed in PROJECT_SOURCE_FILES: the root rule always wins, so a binary
+    # file does not need (and must not need) to be listed to be included.
+    artifact_candidates: list[TreeEntry] = []
+    if artifact_roots:
+        for path, entry in tree.items():
+            if not _under_root(path):
+                continue
+            if _check_candidate(export, entry, selection.not_exported):
+                artifact_candidates.append(entry)
+
+    total = sum(e.size for e in source_candidates) + sum(e.size for e in artifact_candidates)
     if total > export.max_total_bytes:
         raise SnapshotError(f"export would be {total} bytes, above max_total_bytes {export.max_total_bytes}")
-    blobs = read_blobs(git, [e.blob_sha for e in candidates])
-    for entry in candidates:
+
+    blobs = read_blobs(git, [e.blob_sha for e in (*source_candidates, *artifact_candidates)])
+    for entry in source_candidates:
         data = blobs[entry.blob_sha]
         if not is_text(data):
             selection.not_exported[entry.path] = "binary"
             continue
         selection.files[entry.path] = entry
         selection.contents[entry.path] = data
+    for entry in artifact_candidates:
+        selection.files[entry.path] = entry
+        selection.contents[entry.path] = blobs[entry.blob_sha]
+        selection.artifact_paths.add(entry.path)
     return selection
 
 
@@ -193,7 +249,20 @@ def synthetic_tree(git: Git, entries: dict[str, TreeEntry]) -> str:
                 pass
 
 
-_DIFF_ARGS = ["-M", "--full-index", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"]
+# --binary makes binary content appear as a literal/base85 GIT binary patch
+# instead of "Binary files differ"; it is a byte-for-byte no-op on an
+# all-text diff (verified: identical output with and without the flag), so
+# this is safe for format-2 (text-only) projects too.
+_DIFF_ARGS = [
+    "-M",
+    "--full-index",
+    "--binary",
+    "--no-color",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--src-prefix=a/",
+    "--dst-prefix=b/",
+]
 
 
 def tree_diff(git: Git, from_tree: str, to_tree: str) -> bytes:
@@ -274,8 +343,13 @@ def build_generation(
     files_changed, insertions, deletions = tree_diff_stats(git, base_tree, work_tree)
     merge_base, ahead, behind = _branch_relationship(git, integration_commit, working_commit)
 
+    # Format 3 only when a branch's own manifest actually declares artifact
+    # roots; otherwise the output is byte-identical to before this existed.
+    has_artifacts = bool(base.artifact_roots or work.artifact_roots)
+    format_version = FORMAT_VERSION_ARTIFACTS if has_artifacts else FORMAT_VERSION
+
     fingerprint_material = {
-        "format_version": FORMAT_VERSION,
+        "format_version": format_version,
         "integration": [integration_branch, integration_commit, base_tree, base.not_exported],
         "working": [working_branch, working_commit, work_tree, work.not_exported],
         "names": [snapshot_name, diff_name],
@@ -283,19 +357,45 @@ def build_generation(
     fingerprint = hashlib.sha256(json.dumps(fingerprint_material, sort_keys=True).encode()).hexdigest()
     generation_id = new_generation_id(integration_commit, working_commit)
 
-    header = (
-        "# agent-git-bridge working-branch overlay\n"
-        f"# generation: {generation_id}\n"
-        f"# repository: {repository}\n"
-        f"# base: {integration_branch} {integration_commit}\n"
-        f"# target: {working_branch} {working_commit}\n"
-        f"# {'empty: the working tree equals the integration tree' if not body else 'apply to the unzipped snapshot with: git apply'}\n"
-        "\n"
-    ).encode("utf-8")
+    header_lines = [
+        "# agent-git-bridge working-branch overlay",
+        f"# generation: {generation_id}",
+        f"# repository: {repository}",
+        f"# base: {integration_branch} {integration_commit}",
+        f"# target: {working_branch} {working_commit}",
+    ]
+    if has_artifacts:
+        roots = ", ".join(sorted(set(base.artifact_roots) | set(work.artifact_roots))) or "(none)"
+        header_lines.append(f"# format: {format_version} (binary-capable; artifact roots: {roots})")
+    header_lines.append(
+        "# empty: the working tree equals the integration tree" if not body else "# apply to the unzipped snapshot with: git apply"
+    )
+    header = ("\n".join(header_lines) + "\n\n").encode("utf-8")
     diff_bytes = header + body
 
+    files = {p: {"blob_sha": e.blob_sha, "size": e.size} for p, e in sorted(base.files.items())}
+    working_diff: dict[str, Any] = {
+        "filename": diff_name,
+        "sha256": hashlib.sha256(diff_bytes).hexdigest(),
+        "bytes": len(diff_bytes),
+        "base_commit": integration_commit,
+        "target_commit": working_commit,
+        "empty": not body,
+        "files_changed": files_changed,
+        "insertions": insertions,
+        "deletions": deletions,
+        # What the working tree must look like after applying the overlay.
+        "working_files": {p: e.blob_sha for p, e in sorted(work.files.items())},
+        "working_not_exported": dict(sorted(work.not_exported.items())),
+    }
+    if has_artifacts:
+        for path, info in files.items():
+            info["origin"] = "artifact_root" if path in base.artifact_paths else "source"
+        working_diff["working_artifact_roots"] = sorted(work.artifact_roots)
+        working_diff["working_artifact_files"] = sorted(work.artifact_paths)
+
     manifest: dict[str, Any] = {
-        "format_version": FORMAT_VERSION,
+        "format_version": format_version,
         "generation_id": generation_id,
         "generated_at": utc_now(),
         "repository": repository,
@@ -308,24 +408,13 @@ def build_generation(
         "working_ahead_by": ahead,
         "working_behind_by": behind,
         "manifest_path": export.manifest,
-        "files": {p: {"blob_sha": e.blob_sha, "size": e.size} for p, e in sorted(base.files.items())},
+        "files": files,
         "not_exported": dict(sorted(base.not_exported.items())),
-        "working_diff": {
-            "filename": diff_name,
-            "sha256": hashlib.sha256(diff_bytes).hexdigest(),
-            "bytes": len(diff_bytes),
-            "base_commit": integration_commit,
-            "target_commit": working_commit,
-            "empty": not body,
-            "files_changed": files_changed,
-            "insertions": insertions,
-            "deletions": deletions,
-            # What the working tree must look like after applying the overlay.
-            "working_files": {p: e.blob_sha for p, e in sorted(work.files.items())},
-            "working_not_exported": dict(sorted(work.not_exported.items())),
-        },
-        "reader_notes": READER_NOTES,
+        "working_diff": working_diff,
+        "reader_notes": READER_NOTES_ARTIFACTS if has_artifacts else READER_NOTES,
     }
+    if has_artifacts:
+        manifest["artifact_roots"] = sorted(base.artifact_roots)
     return Generation(
         generation_id=generation_id,
         fingerprint=fingerprint,

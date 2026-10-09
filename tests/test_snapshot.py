@@ -19,7 +19,7 @@ import pytest
 from conftest import BRANCH, INTEGRATION, GitEnv, git
 from git_bridge.config import ExportConfig
 from git_bridge.errors import SnapshotError
-from git_bridge.manifest import parse_manifest
+from git_bridge.manifest import parse_artifact_roots, parse_manifest
 from git_bridge.snapshot import build_generation
 from git_bridge.store import git_blob_sha1
 
@@ -27,13 +27,25 @@ MANIFEST_PATH = "docs/design/MANIFEST.md"
 EXPORT = ExportConfig(drive_root="ChatGPT/rot3k", manifest=MANIFEST_PATH)
 
 
-def manifest_md(*paths: str) -> str:
+def manifest_md(*paths: str, roots: tuple[str, ...] = ()) -> str:
     listed = "\n".join(f"  - {p}" for p in (MANIFEST_PATH, *paths))
-    return (
+    text = (
         "# Manifest\n\nProse mentioning docs/ignored.md is not part of the inventory.\n\n"
         "<!-- PROJECT_SOURCE_FILES_BEGIN -->\n```yaml\nproject_source_files:\n"
         f"{listed}\n```\n<!-- PROJECT_SOURCE_FILES_END -->\n"
     )
+    if roots:
+        root_lines = "\n".join(f"  - {r}" for r in roots)
+        text += (
+            "\n<!-- PROJECT_ARTIFACT_ROOTS_BEGIN -->\n```yaml\nproject_artifact_roots:\n"
+            f"{root_lines}\n```\n<!-- PROJECT_ARTIFACT_ROOTS_END -->\n"
+        )
+    return text
+
+
+def png(tag: bytes = b"") -> bytes:
+    """Deterministic binary content (always contains a NUL byte, like a real PNG)."""
+    return b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + tag
 
 
 BASE_FILES = {
@@ -98,15 +110,33 @@ def reconstruct(tmp: Path, snapshot_zip: bytes, overlay: bytes) -> dict[str, byt
 
 
 def selected_tree(env: GitEnv, commit: str) -> dict[str, bytes]:
-    """sel(commit): the files commit's own manifest lists, straight from Git."""
-    listed = parse_manifest(git_show(env, commit, MANIFEST_PATH), MANIFEST_PATH)
-    out = {}
+    """sel(commit): the files commit's own manifest lists (text only) plus every
+    tracked file under its own declared artifact roots (text or binary),
+    computed independently of git_bridge.snapshot via raw Git plumbing."""
+    manifest_bytes = git_show(env, commit, MANIFEST_PATH)
+    listed = parse_manifest(manifest_bytes, MANIFEST_PATH)
+    roots = parse_artifact_roots(manifest_bytes, MANIFEST_PATH)
+
+    def under_root(path: str) -> bool:
+        return any(path.startswith(r) for r in roots)
+
+    out: dict[str, bytes] = {}
     for path in listed:
-        if path == "snapshot.json":  # reserved for the manifest inside the ZIP
+        # Reserved, or under a root: the artifact-root rule below always wins
+        # (it must include a binary file even if also individually listed).
+        if path == "snapshot.json" or under_root(path):
             continue
         data = git_show(env, commit, path, missing_ok=True)
         if data is not None and b"\0" not in data:
             out[path] = data
+    if roots:
+        tracked = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", "-z", commit], cwd=env.origin, capture_output=True, check=True
+        ).stdout.decode("utf-8", errors="surrogateescape").split("\0")
+        for path in tracked:
+            if not path or not under_root(path):
+                continue
+            out[path] = git_show(env, commit, path)
     return out
 
 
@@ -245,6 +275,185 @@ def test_missing_and_binary_listed_files_are_excluded_on_both_sides(proj: GitEnv
     gen = assert_reconstructs(proj, tmp_path)
     assert gen.manifest["not_exported"] == {"docs/logo.bin": "binary", "docs/missing.md": "missing"}
     assert gen.manifest["working_diff"]["empty"]  # binary change is invisible to the text export
+
+
+# --------------------------------------------------------- artifact roots
+
+
+def test_project_without_artifact_roots_stays_format_2(proj: GitEnv, tmp_path):
+    proj.commit_to(BRANCH, {"AGENTS.md": "changed\n"})
+    gen = assert_reconstructs(proj, tmp_path)
+    assert gen.manifest["format_version"] == 2
+    assert "artifact_roots" not in gen.manifest
+    assert "origin" not in next(iter(gen.manifest["files"].values()))
+    assert "working_artifact_files" not in gen.manifest["working_diff"]
+
+
+def test_empty_artifact_root_does_not_break_export(proj: GitEnv, tmp_path):
+    """A declared root with no tracked files under it must not break pull."""
+    proj.commit_to(INTEGRATION, {MANIFEST_PATH: manifest_md(*BASE_LISTED, roots=("assets/gfx/",))})
+    proj.set_branch(BRANCH, proj.head(INTEGRATION))
+    gen = assert_reconstructs(proj, tmp_path)
+    assert gen.manifest["format_version"] == 3
+    assert gen.manifest["artifact_roots"] == ["assets/gfx/"]
+    assert not any(p.startswith("assets/gfx/") for p in gen.manifest["files"])
+    assert gen.manifest["working_diff"]["empty"]
+
+
+def test_artifact_file_present_on_both_branches_is_byte_preserved(proj: GitEnv, tmp_path):
+    base = proj.commit_to(
+        INTEGRATION,
+        {MANIFEST_PATH: manifest_md(*BASE_LISTED, roots=("assets/gfx/",)), "assets/gfx/logo.png": png(b"logo")},
+    )
+    proj.set_branch(BRANCH, base)
+    gen = assert_reconstructs(proj, tmp_path)
+    m, files = unzip(gen.snapshot_zip)
+    assert files["assets/gfx/logo.png"] == png(b"logo")  # stored exactly, no decode/re-encode
+    assert m["files"]["assets/gfx/logo.png"]["origin"] == "artifact_root"
+    assert m["files"][MANIFEST_PATH]["origin"] == "source"
+    assert m["files"]["assets/gfx/logo.png"]["blob_sha"] == git_blob_sha1(png(b"logo"))
+
+
+def test_artifact_root_wins_even_if_the_file_is_also_listed_as_source(proj: GitEnv, tmp_path):
+    """A binary file both listed in PROJECT_SOURCE_FILES and under an artifact
+    root must still be exported (the root rule wins), not dropped as 'binary'."""
+    base = proj.commit_to(
+        INTEGRATION,
+        {
+            MANIFEST_PATH: manifest_md(*BASE_LISTED, "assets/gfx/logo.png", roots=("assets/gfx/",)),
+            "assets/gfx/logo.png": png(b"both"),
+        },
+    )
+    proj.set_branch(BRANCH, base)
+    gen = assert_reconstructs(proj, tmp_path)
+    assert "assets/gfx/logo.png" not in gen.manifest["not_exported"]
+    assert gen.manifest["files"]["assets/gfx/logo.png"]["origin"] == "artifact_root"
+    assert unzip(gen.snapshot_zip)[1]["assets/gfx/logo.png"] == png(b"both")
+
+
+def test_artifact_binary_added_on_working_branch(proj: GitEnv, tmp_path):
+    proj.commit_to(BRANCH, {MANIFEST_PATH: manifest_md(*BASE_LISTED, roots=("assets/gfx/",)), "assets/gfx/new.png": png(b"new")})
+    gen = assert_reconstructs(proj, tmp_path)
+    assert gen.manifest["format_version"] == 3  # D's manifest alone already declares roots
+    assert gen.manifest["artifact_roots"] == []  # M's own manifest declares none yet
+    body = gen.diff_bytes.decode()
+    assert "new file mode" in body and "GIT binary patch" in body
+    assert gen.manifest["working_diff"]["working_artifact_roots"] == ["assets/gfx/"]
+    assert gen.manifest["working_diff"]["working_artifact_files"] == ["assets/gfx/new.png"]
+    assert gen.manifest["working_diff"]["working_files"]["assets/gfx/new.png"] == git_blob_sha1(png(b"new"))
+
+
+def test_artifact_binary_modified_between_branches(proj: GitEnv, tmp_path):
+    base = proj.commit_to(
+        INTEGRATION,
+        {MANIFEST_PATH: manifest_md(*BASE_LISTED, roots=("assets/gfx/",)), "assets/gfx/logo.png": png(b"v1")},
+    )
+    proj.set_branch(BRANCH, base)
+    proj.commit_to(BRANCH, {"assets/gfx/logo.png": png(b"v2-modified")})
+    gen = assert_reconstructs(proj, tmp_path)
+    body = gen.diff_bytes.decode()
+    assert "GIT binary patch" in body and "new file mode" not in body and "deleted file mode" not in body
+    assert gen.manifest["working_diff"]["working_files"]["assets/gfx/logo.png"] == git_blob_sha1(png(b"v2-modified"))
+
+
+def test_artifact_binary_deleted_on_working_branch(proj: GitEnv, tmp_path):
+    base = proj.commit_to(
+        INTEGRATION,
+        {MANIFEST_PATH: manifest_md(*BASE_LISTED, roots=("assets/gfx/",)), "assets/gfx/logo.png": png()},
+    )
+    proj.set_branch(BRANCH, base)
+    proj.commit_to(BRANCH, {"assets/gfx/logo.png": None})
+    gen = assert_reconstructs(proj, tmp_path)
+    assert "deleted file mode" in gen.diff_bytes.decode()
+    assert "assets/gfx/logo.png" not in gen.manifest["working_diff"]["working_files"]
+
+
+def test_mixed_text_and_several_binary_changes_in_one_overlay(proj: GitEnv, tmp_path):
+    # remove.png and added.png must be dissimilar enough that -M rename
+    # detection does not fold this delete+add pair into a single rename.
+    remove_content = bytes((i * 7 + 3) % 256 for i in range(300))
+    added_content = bytes((i * 13 + 5) % 256 for i in range(900))
+    base = proj.commit_to(
+        INTEGRATION,
+        {
+            MANIFEST_PATH: manifest_md(*BASE_LISTED, roots=("assets/gfx/",)),
+            "assets/gfx/keep.png": png(b"keep"),
+            "assets/gfx/modify.png": png(b"before"),
+            "assets/gfx/remove.png": remove_content,
+        },
+    )
+    proj.set_branch(BRANCH, base)
+    proj.commit_to(
+        BRANCH,
+        {
+            "docs/design/RULES.md": "Rule one.\nRule two, amended.\nRule three.\n",
+            "assets/gfx/modify.png": png(b"after"),
+            "assets/gfx/remove.png": None,
+            "assets/gfx/added.png": added_content,
+        },
+    )
+    gen = assert_reconstructs(proj, tmp_path)
+    body = gen.diff_bytes.decode()
+    assert "rename from" not in body and "rename to" not in body  # a real delete + a real add, not a rename
+    assert body.count("GIT binary patch") == 3  # modify.png, remove.png, added.png; keep.png is unchanged
+    assert "Rule two, amended." in body
+    assert sorted(gen.manifest["working_diff"]["working_artifact_files"]) == [
+        "assets/gfx/added.png",
+        "assets/gfx/keep.png",
+        "assets/gfx/modify.png",
+    ]
+
+
+def test_artifact_root_does_not_pull_in_a_symlink_or_oversized_file(proj: GitEnv, tmp_path):
+    base = proj.commit_to(
+        INTEGRATION, {MANIFEST_PATH: manifest_md(*BASE_LISTED, roots=("assets/gfx/",)), "assets/gfx/ok.png": png()}
+    )
+    proj.set_branch(BRANCH, base)
+    git(proj.seed, "fetch", "--quiet", "origin")
+    git(proj.seed, "checkout", "--quiet", "-B", INTEGRATION, f"origin/{INTEGRATION}")
+    git(proj.seed, "reset", "--quiet", "--hard", f"origin/{INTEGRATION}")
+    (proj.seed / "assets" / "gfx" / "huge.png").write_bytes(png() * 100000)
+    git(proj.seed, "add", "-A")
+    # A symlink tree entry via plumbing (no OS symlink needed, portable to Windows):
+    # hash-object -w really writes the blob, so the later commit/write-tree can read it.
+    link_sha = git(proj.seed, "hash-object", "-w", "--stdin", input=b"/etc/passwd")
+    git(proj.seed, "update-index", "--add", "--cacheinfo", f"120000,{link_sha},assets/gfx/link.png")
+    git(proj.seed, "commit", "--quiet", "-m", "artifact root with symlink and oversized file")
+    git(proj.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{INTEGRATION}")
+    git(proj.seed, "clean", "-fdq")
+    proj.set_branch(BRANCH, proj.head(INTEGRATION))
+    export = proj.repo_config.export.model_copy(update={"max_file_bytes": 1024})
+    proj.with_repo_config(export=export)
+    gen = generate(proj)
+    assert gen.manifest["not_exported"]["assets/gfx/link.png"] == "symlink"
+    assert gen.manifest["not_exported"]["assets/gfx/huge.png"] == "too_large"
+    assert "assets/gfx/ok.png" in gen.manifest["files"]
+
+
+def test_malformed_artifact_roots_in_manifest_fails(proj: GitEnv):
+    proj.commit_to(BRANCH, {MANIFEST_PATH: manifest_md(*BASE_LISTED) + "\n<!-- PROJECT_ARTIFACT_ROOTS_BEGIN -->\n```yaml\nproject_artifact_roots: [../etc]\n```\n<!-- PROJECT_ARTIFACT_ROOTS_END -->\n"})
+    with pytest.raises(SnapshotError, match="invalid project_artifact_roots"):
+        generate(proj)
+
+
+@pytest.mark.parametrize(
+    "roots_yaml,problem",
+    [
+        ("project_artifact_roots: [../etc]", "invalid project_artifact_roots"),
+        ("project_artifact_roots: [/abs/path]", "invalid project_artifact_roots"),
+        ("project_artifact_roots: [assets/gfx/, assets/gfx]", "listed twice"),
+        ("project_artifact_roots: not-a-list", "must be a list of strings"),
+        ("not_the_right_key: [a/]", "with no project_artifact_roots"),
+    ],
+)
+def test_malformed_artifact_roots_block_rejected(roots_yaml, problem):
+    manifest = f"<!-- PROJECT_ARTIFACT_ROOTS_BEGIN -->\n{roots_yaml}\n<!-- PROJECT_ARTIFACT_ROOTS_END -->"
+    with pytest.raises(SnapshotError, match=problem):
+        parse_artifact_roots(manifest.encode(), "M.md")
+
+
+def test_no_artifact_roots_block_is_not_an_error():
+    assert parse_artifact_roots(b"# just a manifest, no PROJECT_ARTIFACT_ROOTS block\n", "M.md") == []
 
 
 def test_unicode_paths_and_missing_trailing_newline(proj: GitEnv, tmp_path):

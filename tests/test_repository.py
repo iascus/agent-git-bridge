@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import subprocess
 import sys
 
 import pytest
@@ -18,6 +20,19 @@ def _assert_no_leftover_worktrees(env: GitEnv) -> None:
     listing = git(env.repo_config.local_path, "worktree", "list", "--porcelain")
     assert listing.count("worktree ") == 1  # only the bare repository itself
     assert not any(env.settings.work_dir.iterdir())
+
+
+def _blob(repo_path, commit: str, path: str) -> bytes:
+    """Raw blob bytes (the ``git()`` helper decodes as text, which would
+    corrupt binary content)."""
+    proc = subprocess.run(["git", "cat-file", "blob", f"{commit}:{path}"], cwd=repo_path, capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+def _png(tag: bytes = b"") -> bytes:
+    """Deterministic binary content (always contains a NUL byte, like a real PNG)."""
+    return b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + tag
 
 
 # ---------------------------------------------------------------- happy path
@@ -237,11 +252,92 @@ def test_denied_path_rejected(gitenv: GitEnv):
     assert outcome.error.details["path"] == ".github/workflows/ci.yml"
 
 
-def test_binary_patch_rejected(gitenv: GitEnv):
-    base, patch = gitenv.make_patch({"image.bin": bytes(range(256)) * 4}, binary=True)
+# --------------------------------------------------------------- binary push
+
+
+def test_binary_add_push_succeeds(gitenv: GitEnv):
+    content = _png(b"add")
+    base, patch = gitenv.make_patch({"assets/gfx/new.png": content}, binary=True)
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
+    assert outcome.ok, outcome.error
+    assert outcome.git_push == "success"
+    [cf] = outcome.changed_files
+    assert cf.path == "assets/gfx/new.png" and cf.binary
+    assert (cf.insertions, cf.deletions) == (0, 0)
+    assert _blob(gitenv.origin, outcome.new_sha, "assets/gfx/new.png") == content
+    _assert_no_leftover_worktrees(gitenv)
+
+
+def test_binary_modify_push_succeeds(gitenv: GitEnv):
+    gitenv.commit_to(BRANCH, {"assets/gfx/logo.png": _png(b"v1")})
+    new_content = _png(b"v2-modified")
+    base, patch = gitenv.make_patch({"assets/gfx/logo.png": new_content}, binary=True)
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
+    assert outcome.ok, outcome.error
+    [cf] = outcome.changed_files
+    assert cf.path == "assets/gfx/logo.png" and cf.binary
+    stored = _blob(gitenv.origin, outcome.new_sha, "assets/gfx/logo.png")
+    assert stored == new_content
+    assert hashlib.sha256(stored).hexdigest() == hashlib.sha256(new_content).hexdigest()
+
+
+def test_binary_delete_push_succeeds(gitenv: GitEnv):
+    gitenv.commit_to(BRANCH, {"assets/gfx/logo.png": _png()})
+    base, patch = gitenv.make_patch({"assets/gfx/logo.png": None}, binary=True)
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
+    assert outcome.ok, outcome.error
+    [cf] = outcome.changed_files
+    assert cf.path == "assets/gfx/logo.png" and cf.binary
+    assert git(gitenv.origin, "ls-tree", "--name-only", outcome.new_sha, "assets/gfx/logo.png") == ""
+
+
+def test_mixed_text_and_binary_push_is_atomic(gitenv: GitEnv):
+    gitenv.commit_to(BRANCH, {"assets/gfx/old.png": _png(b"old"), "assets/gfx/keep.png": _png(b"keep")})
+    new_old = _png(b"old-modified")
+    new_added = _png(b"added")
+    base, patch = gitenv.make_patch(
+        {
+            "MANIFEST.md": "# Manifest\n\nLine one.\nchanged.\n",
+            "assets/gfx/new.png": new_added,
+            "assets/gfx/old.png": new_old,
+            "assets/gfx/keep.png": None,
+        },
+        binary=True,
+    )
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
+    assert outcome.ok, outcome.error
+    by_path = {f.path: f for f in outcome.changed_files}
+    assert set(by_path) == {"MANIFEST.md", "assets/gfx/new.png", "assets/gfx/old.png", "assets/gfx/keep.png"}
+    assert not by_path["MANIFEST.md"].binary
+    assert by_path["assets/gfx/new.png"].binary and by_path["assets/gfx/old.png"].binary and by_path["assets/gfx/keep.png"].binary
+    assert _blob(gitenv.origin, outcome.new_sha, "assets/gfx/new.png") == new_added
+    assert _blob(gitenv.origin, outcome.new_sha, "assets/gfx/old.png") == new_old
+    assert git(gitenv.origin, "ls-tree", "--name-only", outcome.new_sha, "assets/gfx/keep.png") == ""
+    assert git(gitenv.origin, "show", f"{outcome.new_sha}:MANIFEST.md") == "# Manifest\n\nLine one.\nchanged."
+
+
+def test_binary_push_rejected_when_base_is_stale(gitenv: GitEnv):
+    base, patch = gitenv.make_patch({"assets/gfx/image.png": _png(b"stale")}, binary=True)
+    moved = gitenv.advance_remote()
+    outcome = gitenv.repo.push(gitenv.artifact(patch, base))
+    assert not outcome.ok
+    assert outcome.error.code == "remote_changed"
+    assert gitenv.head() == moved
+    assert outcome.changed_files == []
+    # remote_changed is raised before any worktree is created; nothing to clean up.
+
+
+def test_binary_symlink_patch_still_rejected(gitenv: GitEnv):
+    """Binary support must not relax the existing symlink/submodule policy."""
+    base = gitenv.head()
+    patch = (
+        b"diff --git a/assets/gfx/link.png b/assets/gfx/link.png\nnew file mode 120000\n"
+        b"--- /dev/null\n+++ b/assets/gfx/link.png\n@@ -0,0 +1 @@\n+/etc/passwd\n\\ No newline at end of file\n"
+    )
     outcome = gitenv.repo.push(gitenv.artifact(patch, base))
     assert outcome.error.code == "patch_policy_violation"
-    assert "binary" in outcome.error.message
+    assert "symlink" in outcome.error.message
+    assert gitenv.head() == base
 
 
 def test_patch_without_changes_rejected(gitenv: GitEnv):

@@ -12,6 +12,18 @@ YAML block between HTML comment markers:
     <!-- PROJECT_SOURCE_FILES_END -->
 
 The manifest is always read from the same commit whose files are exported.
+
+A second, optional block declares **project artifact roots**: repository
+directories whose every tracked Git file is exported as-is, text or binary,
+without the manifest listing each file individually:
+
+    <!-- PROJECT_ARTIFACT_ROOTS_BEGIN -->
+    ```yaml
+    project_artifact_roots:
+      - assets/gfx/
+    ```
+    <!-- PROJECT_ARTIFACT_ROOTS_END -->
+
 Other blocks in the manifest are ignored by the bridge.
 """
 
@@ -25,6 +37,7 @@ from .errors import SnapshotError
 from .store import SNAPSHOT_NAME, check_relative_path
 
 FILES_BLOCK = "PROJECT_SOURCE_FILES"
+ARTIFACT_ROOTS_BLOCK = "PROJECT_ARTIFACT_ROOTS"
 
 
 def _block(text: str, name: str) -> object | None:
@@ -66,3 +79,46 @@ def parse_manifest(content: bytes, manifest_path: str) -> list[str]:
             raise SnapshotError(f"manifest: {path!r} is listed twice")
         seen.add(path)
     return files
+
+
+def check_artifact_root(root: str) -> str:
+    """Validate and normalise one artifact root to ``a/b/`` (trailing slash,
+    no leading slash, no ``.``/``..`` components)."""
+    if not isinstance(root, str):
+        raise SnapshotError("project_artifact_roots entries must be strings")
+    stripped = root[:-1] if root.endswith("/") else root
+    if not stripped:
+        raise SnapshotError(f"invalid project_artifact_roots entry {root!r}: must not be empty")
+    try:
+        check_relative_path(f"{stripped}/.gb-placeholder")
+    except SnapshotError:
+        raise SnapshotError(f"invalid project_artifact_roots entry {root!r}") from None
+    return stripped + "/"
+
+
+def parse_artifact_roots(content: bytes, manifest_path: str) -> list[str]:
+    """The ordered, validated ``project_artifact_roots`` list, or ``[]`` if the
+    manifest declares no :data:`ARTIFACT_ROOTS_BLOCK` block at all."""
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SnapshotError(f"manifest {manifest_path} is not UTF-8") from exc
+    block = _block(text, ARTIFACT_ROOTS_BLOCK)
+    if block is None:
+        return []
+    if not isinstance(block, dict) or "project_artifact_roots" not in block:
+        raise SnapshotError(
+            f"manifest {manifest_path} has a {ARTIFACT_ROOTS_BLOCK} block with no project_artifact_roots"
+        )
+    roots = block["project_artifact_roots"]
+    if not isinstance(roots, list) or not all(isinstance(r, str) for r in roots):
+        raise SnapshotError("manifest: project_artifact_roots must be a list of strings")
+    normalised: list[str] = []
+    seen: set[str] = set()
+    for root in roots:
+        checked = check_artifact_root(root)
+        if checked in seen:
+            raise SnapshotError(f"manifest: artifact root {checked!r} is listed twice")
+        seen.add(checked)
+        normalised.append(checked)
+    return normalised

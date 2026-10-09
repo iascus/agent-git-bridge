@@ -143,7 +143,7 @@ def test_push_raw_body(client, gitenv: GitEnv):
     body = r.json()
     assert body["ok"] and body["git_push"] == "success"
     assert body["old_sha"] == base and body["new_sha"] == gitenv.head()
-    assert body["changed_files"] == [{"path": "records/new.md", "insertions": 1, "deletions": 0}]
+    assert body["changed_files"] == [{"path": "records/new.md", "insertions": 1, "deletions": 0, "binary": False}]
     assert body["validation"]["passed"]
     assert body["snapshot_refresh"] == "not_configured"
     assert body["operation"] == "push"

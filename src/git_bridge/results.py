@@ -24,6 +24,7 @@ class ChangedFile(BaseModel):
     path: str
     insertions: int
     deletions: int
+    binary: bool = False
 
 
 class ErrorInfo(BaseModel):
