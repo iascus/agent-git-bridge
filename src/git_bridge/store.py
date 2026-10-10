@@ -71,13 +71,22 @@ def _atomic_write(target: Path, data: bytes) -> None:
 
 class LocalDirectorySnapshotStore(SnapshotStore):
     """Writes artifacts into a local directory (development, tests, or a
-    folder synchronised by another tool)."""
+    folder synchronised by another tool).
 
-    def __init__(self, root: Path) -> None:
+    ``branch`` is ``None`` for a repository's default pair (unchanged
+    sidecar name, for continuity with stores created before this existed),
+    or an additional working branch's name, which only changes the sidecar
+    metadata filename: artifact file names are already branch-specific
+    (``<key>-<branch>-snapshot.zip``), so only the role's own bookkeeping
+    file needs to stay out of the default pair's way."""
+
+    def __init__(self, root: Path, *, branch: str | None = None) -> None:
         self.root = Path(root)
+        self.branch = branch
 
     def _info_path(self, role: Role) -> Path:
-        return self.root / f".gb-{role}.json"
+        suffix = role if self.branch is None else f"{role}@{self.branch}"
+        return self.root / f".gb-{suffix}.json"
 
     def put_artifact(self, role: Role, name: str, data: bytes, mime_type: str, info: dict[str, str]) -> str:
         if "/" in name or "\\" in name or name.startswith("."):

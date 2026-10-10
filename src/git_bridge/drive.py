@@ -54,11 +54,22 @@ _KIND = {"snapshot": "archive", "working_diff": "working_diff"}
 
 
 class GoogleDriveSnapshotStore(SnapshotStore):
-    def __init__(self, api: DriveApi, *, repo_key: str, drive_root: str) -> None:
+    """``branch`` is ``None`` for a repository's default pair (unchanged
+    ``gb_kind`` values, so its existing Drive files keep their stable file
+    ID across this feature's introduction), or an additional working
+    branch's name, which gets its own ``gb_kind`` value (``"<kind>@<branch>"``)
+    so its files can never be found by, or collide with, the default pair's
+    query — not even if both live under the same ``drive_root``."""
+
+    def __init__(self, api: DriveApi, *, repo_key: str, drive_root: str, branch: str | None = None) -> None:
         self.api = api
         self.repo_key = repo_key
         self.drive_root = drive_root.strip("/")
+        self.branch = branch
         self._root_id: str | None = None
+
+    def _kind(self, role: Role) -> str:
+        return _KIND[role] if self.branch is None else f"{_KIND[role]}@{self.branch}"
 
     def _props(self, kind: str, **extra: str) -> dict[str, str]:
         return {"gb_repo": self.repo_key, "gb_kind": kind, **extra}
@@ -76,13 +87,13 @@ class GoogleDriveSnapshotStore(SnapshotStore):
         return self._root_id
 
     def _find(self, role: Role) -> DriveFile | None:
-        matches = self.api.list_files(self._props(_KIND[role]))
+        matches = self.api.list_files(self._props(self._kind(role)))
         for extra in matches[1:]:  # left by an interrupted run
             self.api.trash_file(extra.id)
         return matches[0] if matches else None
 
     def put_artifact(self, role: Role, name: str, data: bytes, mime_type: str, info: dict[str, str]) -> str:
-        props = self._props(_KIND[role], **{f"gb_{k}": v for k, v in info.items()})
+        props = self._props(self._kind(role), **{f"gb_{k}": v for k, v in info.items()})
         current = self._find(role)
         if current is not None:
             # Same Drive file: stable ID and name, content replaced in one write.

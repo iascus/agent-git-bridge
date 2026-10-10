@@ -38,7 +38,9 @@ class PushRequest(BaseModel):
 
     format_version: Literal[1]
     repository: str
-    branch: str
+    # None (or the field omitted) selects the repository's default working
+    # branch; repository policy resolves it, never this parser.
+    branch: str | None = None
     expected_base_sha: str
     patch_sha256: str
     commit_message: Annotated[str, Field(min_length=1)]
@@ -62,8 +64,8 @@ class PushRequest(BaseModel):
 
     @field_validator("branch")
     @classmethod
-    def _branch(cls, v: str) -> str:
-        if not is_safe_branch_name(v):
+    def _branch(cls, v: str | None) -> str | None:
+        if v is not None and not is_safe_branch_name(v):
             raise ValueError("invalid branch name")
         return v
 

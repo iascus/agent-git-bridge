@@ -334,6 +334,7 @@ def build_generation(
     export: ExportConfig,
     snapshot_name: str,
     diff_name: str,
+    additional_working_branches: list[str] | None = None,
 ) -> Generation:
     base = select_files(git, integration_commit, export)
     work = select_files(git, working_commit, export)
@@ -415,6 +416,10 @@ def build_generation(
     }
     if has_artifacts:
         manifest["artifact_roots"] = sorted(base.artifact_roots)
+    if additional_working_branches:
+        # Informational: which other working-branch pairs this project
+        # configures, so a reader of any one pair can discover the others.
+        manifest["additional_working_branches"] = sorted(additional_working_branches)
     return Generation(
         generation_id=generation_id,
         fingerprint=fingerprint,

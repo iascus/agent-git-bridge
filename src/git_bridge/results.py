@@ -160,6 +160,26 @@ class SnapshotInfo(BaseModel):
     error: str | None = None
 
 
+class AdditionalBranchStatus(BaseModel):
+    """Status of one additional working branch's pair.
+
+    state:
+      ok               the branch exists remotely; fields below are filled
+      skipped_missing  the branch does not exist on the remote (not an error)
+      failed           a transport/Git failure while checking it (distinct
+                       from skipped_missing: this must not be mistaken for
+                       "the branch does not exist")
+    """
+
+    branch: str
+    state: Literal["ok", "skipped_missing", "failed"]
+    commit: str | None = None
+    generation_id: str | None = None
+    snapshot_name: str | None = None
+    working_diff_name: str | None = None
+    error: str | None = None
+
+
 class RepositoryStatus(BaseModel):
     repository: str
     key: str
@@ -170,6 +190,8 @@ class RepositoryStatus(BaseModel):
     working_behind_by: int | None = None
     rebase: RebaseInfo | None = None
     snapshot: SnapshotInfo | None = None
+    # One entry per configured repositories.*.additional_working_branches.
+    additional_branches: dict[str, AdditionalBranchStatus] = Field(default_factory=dict)
 
 
 class WorkingDiffInfo(BaseModel):
@@ -180,6 +202,31 @@ class WorkingDiffInfo(BaseModel):
     files_changed: int
     insertions: int
     deletions: int
+
+
+class AdditionalBranchRefresh(BaseModel):
+    """Refresh result of one additional working branch's pair, independent
+    of the default pair's own generation, fingerprint and SHA-256 link.
+
+    state: see :class:`AdditionalBranchStatus`; "failed" covers both a
+    Git/transport failure and an export (Drive/local) failure, distinguished
+    only by ``error.code`` — either way nothing about the default pair, or
+    any other additional branch, is affected.
+    """
+
+    branch: str
+    state: Literal["ok", "skipped_missing", "failed"]
+    working_commit: str | None = None
+    generation_id: str | None = None
+    uploaded: bool = False
+    snapshot_name: str | None = None
+    snapshot_sha256: str | None = None
+    snapshot_bytes: int | None = None
+    file_count: int = 0
+    not_exported: int = 0
+    working_diff: WorkingDiffInfo | None = None
+    rebase: RebaseInfo | None = None
+    error: ErrorInfo | None = None
 
 
 class RefreshOutcome(BaseModel):
@@ -203,6 +250,13 @@ class RefreshOutcome(BaseModel):
     not_exported: int = 0
     working_diff: WorkingDiffInfo | None = None
     rebase: RebaseInfo | None = None
+    # One entry per configured repositories.*.additional_working_branches.
+    # Each is isolated from the others and from the default pair's own
+    # export step: one branch's failure never affects another's result. If
+    # ``error`` below is set, the repository-level prerequisites (clone,
+    # fetching the required default pair) failed and nothing was attempted,
+    # so this map is empty; that is the only case in which it stays empty.
+    additional_branches: dict[str, AdditionalBranchRefresh] = Field(default_factory=dict)
     error: ErrorInfo | None = None
     message: str = ""
 

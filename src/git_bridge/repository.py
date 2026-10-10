@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -35,6 +36,8 @@ from .events import EventLog
 from .github import GitHubApi, GitHubClient, PullRequestError
 from .gitcmd import Git, github_auth_env, minimal_env, tail
 from .results import (
+    AdditionalBranchRefresh,
+    AdditionalBranchStatus,
     BranchHead,
     ChangedFile,
     CheckResult,
@@ -48,18 +51,37 @@ from .results import (
     ValidationReport,
     WorkingDiffInfo,
 )
-from .snapshot import build_generation, export_generation
+from .snapshot import Generation, build_generation, export_generation
 from .store import SnapshotStore
 
-StoreFactory = Callable[["Repository"], SnapshotStore]
+StoreFactory = Callable[["Repository", "str | None"], SnapshotStore]
 
 REGULAR_FILE_MODES = frozenset({"100644", "100755", "000000"})
 _PUSH_RACE_REASONS = ("non-fast-forward", "fetch first", "stale info", "already exists")
+# Git's own wording (verified across versions) when a fetch refspec names a
+# branch the remote does not have; distinct from any network/auth failure,
+# which must never be mistaken for "the branch does not exist yet".
+_MISSING_REF_MARKER = "couldn't find remote ref"
 VALIDATION_OUTPUT_TAIL = 4000
 
 
 def _error_info(exc: BridgeError) -> ErrorInfo:
     return ErrorInfo(code=exc.code, message=exc.message, http_status=exc.http_status, details=exc.details)
+
+
+@dataclass
+class _PreparedBranch:
+    """The git-level half of one additional working branch's refresh,
+    computed while the repository lock is held. ``export()`` (the Drive/local
+    upload) runs afterwards, outside that lock, under ``export_lock`` only."""
+
+    branch: str
+    store: SnapshotStore | None = None
+    generation: Generation | None = None
+    rebase: RebaseInfo | None = None
+    skipped: bool = False
+    error: ErrorInfo | None = None
+    working_commit: str | None = None
 
 
 def normalise_commit_message(message: str) -> str:
@@ -149,9 +171,11 @@ class Repository:
         return self.git.text(["rev-parse", "--verify", "--end-of-options", self.tracking_ref(branch) + "^{commit}"])
 
     def fetch(self, *branches: str) -> dict[str, str]:
-        """Fetch the given configured branches in one operation; return their heads."""
+        """Fetch the given branches (any role this repository knows about) in
+        one operation; return their heads. Every named branch must exist on
+        the remote; use fetch_optional() for one that may not."""
         for branch in branches:
-            if branch not in self.config.branches:
+            if branch not in self.config.known_branches:
                 raise NotAllowed("branch is not configured for this repository")
         refspecs = [f"+refs/heads/{b}:{self.tracking_ref(b)}" for b in branches]
         self.git.run(
@@ -160,8 +184,27 @@ class Repository:
         )
         return {b: self._resolve(b) for b in branches}
 
+    def fetch_optional(self, branch: str) -> str | None:
+        """Fetch one additional working branch; None if it does not exist on
+        the remote. Any other failure (network, auth, ...) propagates, so it
+        is never mistaken for 'the branch does not exist'."""
+        if branch not in self.config.additional_working_branches:
+            raise NotAllowed("branch is not an additional working branch")
+        refspec = f"+refs/heads/{branch}:{self.tracking_ref(branch)}"
+        result = self.git.run(
+            ["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", self.config.remote, refspec],
+            env=self._network_env(),
+            check=False,
+        )
+        if result.returncode == 0:
+            return self._resolve(branch)
+        if _MISSING_REF_MARKER in result.stderr.lower():
+            return None
+        raise GitError("git fetch failed", returncode=result.returncode, stderr=tail(result.stderr))
+
     def fetch_heads(self) -> tuple[str, str]:
-        """(integration head M, working head D), resolved together."""
+        """(integration head M, working head D), resolved together. Both
+        must exist: this is the required default pair."""
         heads = self.fetch(*self.config.branches)
         return heads[self.config.integration_branch], heads[self.config.working_branch]
 
@@ -186,10 +229,12 @@ class Repository:
                 status.merge_base_commit, status.working_ahead_by, status.working_behind_by = self._relationship(
                     integration.commit, working.commit
                 )
-                status.rebase = self._rebase_check(integration.commit, working.commit)
+                status.rebase = self._rebase_check(integration.commit, working.commit, cfg.working_branch)
+            for branch in cfg.additional_working_branches:
+                status.additional_branches[branch] = self._status_for_additional_branch(branch)
         if cfg.export is not None and self.store_factory is not None:
             try:
-                store = self.store_factory(self)
+                store = self._store()
                 snap = store.get_artifact_info("snapshot") or {}
                 diff = store.get_artifact_info("working_diff") or {}
                 files = snap.get("files", "")
@@ -207,6 +252,28 @@ class Repository:
                 status.snapshot = SnapshotInfo(error=f"{type(exc).__name__}: {str(exc)[:300]}")
         return status
 
+    def _status_for_additional_branch(self, branch: str) -> AdditionalBranchStatus:
+        """Caller holds self.lock. Never raises: a problem with one
+        additional branch must not break /status for the rest of the repo."""
+        try:
+            commit = self.fetch_optional(branch)
+        except BridgeError as exc:
+            return AdditionalBranchStatus(branch=branch, state="failed", error=exc.message)
+        if commit is None:
+            return AdditionalBranchStatus(branch=branch, state="skipped_missing")
+        result = AdditionalBranchStatus(branch=branch, state="ok", commit=commit)
+        if self.config.export is not None and self.store_factory is not None:
+            try:
+                store = self._store(branch)
+                snap = store.get_artifact_info("snapshot") or {}
+                diff = store.get_artifact_info("working_diff") or {}
+                result.generation_id = snap.get("generation_id")
+                result.snapshot_name = snap.get("name")
+                result.working_diff_name = diff.get("name")
+            except Exception:
+                pass  # informational only
+        return result
+
     # --------------------------------------------------------------- snapshot
 
     @property
@@ -219,21 +286,35 @@ class Repository:
         export = self.config.export
         return export.working_diff_name if export and export.working_diff_name else f"{self.key}-working.diff"
 
-    def _store(self) -> SnapshotStore:
+    def _additional_snapshot_name(self, branch: str) -> str:
+        return f"{self.key}-{branch}-snapshot.zip"
+
+    def _additional_working_diff_name(self, branch: str) -> str:
+        return f"{self.key}-{branch}-working.diff"
+
+    def _store(self, branch: str | None = None) -> SnapshotStore:
+        """``branch=None`` is the repository's default pair (unchanged
+        artifact identity); any other value is an additional working
+        branch's own, independently identified pair."""
         if self.config.export is None:
             raise SnapshotNotConfigured("repository has no export configuration")
         if self.store_factory is None:
             raise SnapshotNotConfigured("no snapshot transport is configured")
         try:
-            return self.store_factory(self)
+            return self.store_factory(self, branch)
         except BridgeError:
             raise
         except Exception as exc:
             raise SnapshotError(f"cannot open snapshot store: {type(exc).__name__}: {str(exc)[:300]}") from exc
 
     def refresh(self, *, allow_rebase: bool = True) -> RefreshOutcome:
-        """Resolve both branch heads together and export one generation:
-        the integration snapshot and the integration -> working overlay.
+        """Resolve the default pair's branch heads together and export one
+        generation: the integration snapshot and the integration -> working
+        overlay. Then, best-effort and independently of each other and of
+        the default pair, do the same for every configured additional
+        working branch that exists on the remote (one not found is reported
+        as skipped, never an error; one that fails some other way is
+        reported as failed, which must never be confused with "skipped").
 
         With ``rebase_after_squash_merge`` and ``allow_rebase``, a working
         branch that still contains a squash-merged PR is first rebased onto
@@ -252,7 +333,7 @@ class Repository:
             with self.lock:
                 self.ensure_clone()
                 integration, working = self.fetch_heads()
-                outcome.rebase = self._rebase_check(integration, working)
+                outcome.rebase = self._rebase_check(integration, working, cfg.working_branch)
                 if (
                     allow_rebase
                     and cfg.rebase_after_squash_merge
@@ -260,7 +341,7 @@ class Repository:
                     and outcome.rebase.state == "needed"
                 ):
                     self._remove_stale_worktrees()
-                    outcome.rebase = self._rebase_after_merge(integration, working, outcome.rebase)
+                    outcome.rebase = self._rebase_after_merge(integration, working, outcome.rebase, cfg.working_branch)
                     if outcome.rebase.state == "rebased":
                         working = outcome.rebase.new_commit
                 gen = build_generation(
@@ -274,7 +355,14 @@ class Repository:
                     export=cfg.export,
                     snapshot_name=self.snapshot_name,
                     diff_name=self.working_diff_name,
+                    additional_working_branches=list(cfg.additional_working_branches),
                 )
+                # Git-level work only; exporting (potentially slow) happens
+                # below, after self.lock is released.
+                prepared = [
+                    self._prepare_additional_branch(branch, integration, allow_rebase=allow_rebase)
+                    for branch in cfg.additional_working_branches
+                ]
             with self.export_lock:
                 result = export_generation(store, gen)
             m = gen.manifest
@@ -301,6 +389,7 @@ class Repository:
                 insertions=d["insertions"],
                 deletions=d["deletions"],
             )
+            outcome.additional_branches = {p.branch: self._export_additional_branch(p) for p in prepared}
         except BridgeError as exc:
             outcome.error = _error_info(exc)
         self.events.emit(
@@ -318,14 +407,97 @@ class Repository:
             rebase_pr=outcome.rebase.pull_request if outcome.rebase else None,
             files=outcome.file_count,
             overlay_files=outcome.working_diff.files_changed if outcome.working_diff else None,
+            additional_branches={b: r.state for b, r in outcome.additional_branches.items()},
             duration_ms=int((time.monotonic() - started) * 1000),
         )
         return outcome.summarise()
 
+    def _prepare_additional_branch(self, branch: str, integration: str, *, allow_rebase: bool) -> _PreparedBranch:
+        """Fetch, rebase-check (and rebase if due) and build one additional
+        branch's generation. Caller holds self.lock. Any failure is caught
+        here, never raised: one branch's trouble can never affect the
+        default pair or another additional branch."""
+        try:
+            store = self._store(branch)
+            branch_head = self.fetch_optional(branch)
+            if branch_head is None:
+                return _PreparedBranch(branch=branch, store=store, skipped=True)
+            rebase_info = self._rebase_check(integration, branch_head, branch)
+            if (
+                allow_rebase
+                and self.config.rebase_after_squash_merge
+                and rebase_info is not None
+                and rebase_info.state == "needed"
+            ):
+                self._remove_stale_worktrees()
+                rebase_info = self._rebase_after_merge(integration, branch_head, rebase_info, branch)
+                if rebase_info.state == "rebased":
+                    branch_head = rebase_info.new_commit
+            gen = build_generation(
+                self.git,
+                integration_commit=integration,
+                working_commit=branch_head,
+                repository=self.config.github_repo,
+                project_key=self.key,
+                integration_branch=self.config.integration_branch,
+                working_branch=branch,
+                export=self.config.export,
+                snapshot_name=self._additional_snapshot_name(branch),
+                diff_name=self._additional_working_diff_name(branch),
+                additional_working_branches=list(self.config.additional_working_branches),
+            )
+            return _PreparedBranch(branch=branch, store=store, generation=gen, rebase=rebase_info, working_commit=branch_head)
+        except BridgeError as exc:
+            return _PreparedBranch(branch=branch, error=_error_info(exc))
+
+    def _export_additional_branch(self, prepared: _PreparedBranch) -> AdditionalBranchRefresh:
+        """Caller does not hold self.lock; only export_lock, briefly."""
+        if prepared.error is not None:
+            return AdditionalBranchRefresh(branch=prepared.branch, state="failed", error=prepared.error)
+        if prepared.skipped:
+            return AdditionalBranchRefresh(branch=prepared.branch, state="skipped_missing")
+        gen, store = prepared.generation, prepared.store
+        assert gen is not None and store is not None  # guaranteed by _prepare_additional_branch
+        try:
+            with self.export_lock:
+                result = export_generation(store, gen)
+        except BridgeError as exc:
+            return AdditionalBranchRefresh(
+                branch=prepared.branch,
+                state="failed",
+                error=_error_info(exc),
+                working_commit=prepared.working_commit,
+                rebase=prepared.rebase,
+            )
+        d = gen.manifest["working_diff"]
+        return AdditionalBranchRefresh(
+            branch=prepared.branch,
+            state="ok",
+            working_commit=prepared.working_commit,
+            generation_id=result.generation_id,
+            uploaded=result.uploaded,
+            snapshot_name=gen.snapshot_name,
+            snapshot_sha256=result.snapshot_sha256,
+            snapshot_bytes=result.snapshot_bytes,
+            file_count=len(gen.manifest["files"]),
+            not_exported=len(gen.manifest["not_exported"]),
+            working_diff=WorkingDiffInfo(
+                filename=d["filename"],
+                sha256=d["sha256"] if result.uploaded else (store.get_artifact_info("working_diff") or {}).get("sha256", d["sha256"]),
+                bytes=d["bytes"],
+                empty=d["empty"],
+                files_changed=d["files_changed"],
+                insertions=d["insertions"],
+                deletions=d["deletions"],
+            ),
+            rebase=prepared.rebase,
+        )
+
     def push_and_refresh(self, artifact: PushArtifact) -> PushOutcome:
-        """Push to the working branch, open a PR if configured, then refresh
-        the snapshot from the branch heads as they now are. Failures after the
-        push are reported but never turn a successful push into a failure."""
+        """Push to the selected working branch, open a PR if configured, then
+        refresh every pair (default and additional) from the branch heads as
+        they now are. Failures after the push are reported but never turn a
+        successful push into a failure."""
         outcome = self.push(artifact)
         if not outcome.ok or outcome.new_sha is None:
             return outcome
@@ -334,12 +506,12 @@ class Repository:
         if self.config.export is None or self.store_factory is None:
             outcome.snapshot_refresh = "not_configured"
             try:
-                outcome.rebase = self.rebase_status()
+                outcome.rebase = self.rebase_status(outcome.branch)
             except BridgeError as exc:  # informational only; the push has succeeded
                 outcome.rebase = RebaseInfo(state="failed", error=exc.message)
             return outcome.summarise()
         refreshed = self.refresh(allow_rebase=False)  # a push never rewrites history
-        outcome.rebase = refreshed.rebase
+        outcome.rebase = self._rebase_of_pushed_branch(refreshed, outcome.branch)
         if refreshed.ok:
             outcome.snapshot_refresh = "success"
             outcome.snapshot_generation_id = refreshed.generation_id
@@ -355,6 +527,15 @@ class Repository:
         )
         return outcome.summarise()
 
+    def _rebase_of_pushed_branch(self, refreshed: RefreshOutcome, branch: str) -> RebaseInfo | None:
+        """Pick out, from a just-completed multi-branch refresh, the rebase
+        status of whichever branch was actually pushed to (default or
+        additional) — never always the default pair's."""
+        if branch == self.config.working_branch:
+            return refreshed.rebase
+        extra = refreshed.additional_branches.get(branch)
+        return extra.rebase if extra is not None else None
+
     # --------------------------------------------------------------- pipeline
 
     def validate_patch(self, artifact: PushArtifact) -> PushOutcome:
@@ -367,25 +548,28 @@ class Repository:
         accepted = {name.casefold() for name in self.config.accepted_github_repos}
         if req.repository.casefold() not in accepted:
             raise NotAllowed("repository in request.json does not match this endpoint's repository")
-        if req.branch != self.config.working_branch:
+        # An absent/null branch selects the default working branch.
+        requested = req.branch if req.branch is not None else self.config.working_branch
+        if requested not in self.config.all_working_branches:
             raise NotAllowed(
-                f"pushes may only target the working branch {self.config.working_branch!r}",
+                f"pushes may only target an allowed working branch {list(self.config.all_working_branches)!r}",
                 branch=req.branch,
             )
-        return self.config.working_branch  # the configured string from here on
+        return requested  # the configured string from here on
 
     def _execute(self, artifact: PushArtifact, *, push: bool) -> PushOutcome:
         req = artifact.request
         outcome = PushOutcome(
             operation="push" if push else "validate",
             repository=req.repository,
-            branch=req.branch,
+            branch=req.branch,  # raw request value (may be None); resolved below once authorised
             expected_base_sha=req.expected_base_sha,
             commit_message=req.commit_message,
         )
         started = time.monotonic()
         try:
             branch = self._authorise(req)
+            outcome.branch = branch  # the resolved, never-None branch, from here on
             with self.lock:
                 self.ensure_clone()
                 self._remove_stale_worktrees()
@@ -425,7 +609,8 @@ class Repository:
             outcome.operation,
             repo=self.key,
             repository=req.repository,
-            branch=req.branch,
+            branch=outcome.branch,
+            requested_branch=req.branch,
             expected_sha=req.expected_base_sha,
             observed_sha=outcome.observed_sha,
             new_sha=outcome.new_sha,
@@ -445,14 +630,20 @@ class Repository:
         # Exit 1: not an ancestor; 128: unknown object. Both mean "no".
         return self.git.run(["merge-base", "--is-ancestor", ancestor, commit], check=False).returncode == 0
 
-    def rebase_status(self) -> RebaseInfo | None:
+    def rebase_status(self, branch: str | None = None) -> RebaseInfo | None:
+        """Rebase status of ``branch`` (default: the repository's default
+        working branch). Both ``branch`` and the integration branch must
+        exist remotely; callers only ever pass a branch known to exist
+        (the default, or one just pushed to)."""
+        branch = branch or self.config.working_branch
         with self.lock:
             self.ensure_clone()
-            integration, working = self.fetch_heads()
-            return self._rebase_check(integration, working)
+            heads = self.fetch(self.config.integration_branch, branch)
+            return self._rebase_check(heads[self.config.integration_branch], heads[branch], branch)
 
-    def _rebase_check(self, integration: str, working: str) -> RebaseInfo | None:
-        """Does the working branch still contain the latest squash-merged PR?
+    def _rebase_check(self, integration: str, working: str, branch: str) -> RebaseInfo | None:
+        """Does ``branch`` still contain the latest PR from it that was
+        squash-merged into the integration branch?
 
         None when the repository has no GitHub API client (nothing to check)."""
         if self.github is None:
@@ -461,7 +652,7 @@ class Repository:
             return None
         cfg = self.config
         try:
-            merged = self.github.latest_merged_pull_request(cfg.github_repo, cfg.working_branch, cfg.integration_branch)
+            merged = self.github.latest_merged_pull_request(cfg.github_repo, branch, cfg.integration_branch)
         except PullRequestError as exc:
             return RebaseInfo(state="failed", error=exc.message)
         except Exception as exc:  # a status check must never break a push or refresh
@@ -482,9 +673,9 @@ class Repository:
             info.replayed_commits = int(self.git.text(["rev-list", "--count", f"{head}..{working}"]))
         return info
 
-    def _rebase_after_merge(self, integration: str, working: str, info: RebaseInfo) -> RebaseInfo:
+    def _rebase_after_merge(self, integration: str, working: str, info: RebaseInfo, branch: str) -> RebaseInfo:
         """Replay only the commits made after the merged PR head onto the
-        integration branch, verify, and update the working branch with a
+        integration branch, verify, and update ``branch`` with a
         lease-guarded force push. Nothing changes unless every step succeeds.
         Caller holds self.lock."""
         base = info.merged_head
@@ -527,8 +718,8 @@ class Repository:
                 result.state = "failed"
                 result.error = "rebased tree differs from the merge result; not pushed"
                 return result
-            self._push(new_commit, self.config.working_branch, lease=working)
-            self._refresh_tracking_ref(self.config.working_branch)
+            self._push(new_commit, branch, lease=working)
+            self._refresh_tracking_ref(branch)
         except BridgeError as exc:
             result.state = "failed"
             result.error = exc.message
@@ -539,6 +730,7 @@ class Repository:
         self.events.emit(
             "rebase",
             repo=self.key,
+            branch=branch,
             pull_request=result.pull_request,
             old_commit=working,
             new_commit=new_commit,
@@ -548,12 +740,14 @@ class Repository:
         return result
 
     def _ensure_pull_request(self, outcome: PushOutcome) -> PullRequestInfo | None:
-        """Open a PR from the working branch into the integration branch unless
-        one is open. Failures are reported; they never undo or fail the push."""
+        """Open a PR from the branch just pushed to (default or additional)
+        into the integration branch unless one is open. Failures are
+        reported; they never undo or fail the push."""
         cfg = self.config.pull_request
         if cfg is None:
             return None
-        head, base = self.config.working_branch, self.config.integration_branch
+        assert outcome.branch is not None  # set by _execute on every successful push
+        head, base = outcome.branch, self.config.integration_branch
         if self.github is None:
             return PullRequestInfo(state="failed", base=base, error="no GitHub API client configured")
         repo = self.config.github_repo
@@ -721,11 +915,12 @@ class Repository:
     def _push(self, sha: str, branch: str, *, lease: str | None = None) -> None:
         # Normal pushes: plain refspec, no '+', no --force. A non-fast-forward
         # is rejected by Git and reported, never retried.
-        # Only the post-merge rebase passes ``lease``: the working branch is
-        # replaced only if it still points at exactly that commit.
+        # Only the post-merge rebase passes ``lease``: a working branch
+        # (default or additional) is replaced only if it still points at
+        # exactly that commit. The integration branch may never be rewritten.
         target = f"refs/heads/{branch}"
-        if lease is not None and branch != self.config.working_branch:
-            raise NotAllowed("only the working branch may be rewritten")
+        if lease is not None and branch not in self.config.all_working_branches:
+            raise NotAllowed("only a working branch may be rewritten")
         options = [f"--force-with-lease={target}:{lease}"] if lease is not None else []
         result = self.git.run(
             ["push", "--porcelain", *options, self.config.remote, f"{sha}:{target}"],
@@ -803,8 +998,8 @@ def default_store_factory(settings: Settings) -> StoreFactory | None:
 
         root = settings.snapshot.local_root
 
-        def local(repo: Repository) -> SnapshotStore:
-            return LocalDirectorySnapshotStore(root.joinpath(*repo.config.export.drive_root.split("/")))
+        def local(repo: Repository, branch: str | None = None) -> SnapshotStore:
+            return LocalDirectorySnapshotStore(root.joinpath(*repo.config.export.drive_root.split("/")), branch=branch)
 
         return local
 
@@ -812,9 +1007,9 @@ def default_store_factory(settings: Settings) -> StoreFactory | None:
 
     token_file = settings.google.token_file
 
-    def google(repo: Repository) -> SnapshotStore:
+    def google(repo: Repository, branch: str | None = None) -> SnapshotStore:
         return GoogleDriveSnapshotStore(
-            build_drive_api(token_file), repo_key=repo.key, drive_root=repo.config.export.drive_root
+            build_drive_api(token_file), repo_key=repo.key, drive_root=repo.config.export.drive_root, branch=branch
         )
 
     return google

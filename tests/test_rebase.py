@@ -64,7 +64,7 @@ def env(gitenv: GitEnv) -> GitEnv:
     gitenv.with_repo_config(export=EXPORT, rebase_after_squash_merge=True)
     gitenv.github = FakeGitHub()
     gitenv.export_root = gitenv.tmp / "export"
-    gitenv.store_factory = lambda repo: LocalDirectorySnapshotStore(gitenv.export_root)
+    gitenv.store_factory = lambda repo, branch=None: LocalDirectorySnapshotStore(gitenv.export_root, branch=branch)
     # A first round of work on design-docs (three commits), then squash-merged as PR #47.
     gitenv.commit_to(BRANCH, {"AGENTS.md": "Agents v2\n"}, "C1")
     gitenv.commit_to(BRANCH, {"AGENTS.md": "Agents v3\n"}, "C2 rewrites C1's line")

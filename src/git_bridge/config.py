@@ -17,6 +17,10 @@ GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]{
 REPO_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 REMOTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _BRANCH_CHARS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+# Additional working branches are used verbatim in Drive/local artifact file
+# names and as an opaque Drive property value, so (unlike working_branch)
+# they may not contain "/".
+ADDITIONAL_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 
 def is_safe_branch_name(name: str) -> bool:
@@ -121,8 +125,16 @@ class RepositoryConfig(_Strict):
     remote_url: str | None = None
     # Integration: read only, exported as the complete baseline (e.g. main).
     integration_branch: str
-    # Working: the only branch a push may advance (e.g. design-docs).
+    # Working: the default branch a push advances when request.json omits
+    # "branch" (e.g. design-docs).
     working_branch: str
+    # Other allowlisted push targets (e.g. "gfx-assets" for binary asset
+    # batches), each exported as its own snapshot + overlay pair alongside
+    # the default one. Never created automatically: a refresh or status call
+    # that finds one missing on the remote reports it as skipped, not an
+    # error. Must not contain "/" (used verbatim in artifact file names and
+    # as a Drive property value).
+    additional_working_branches: list[str] = Field(default_factory=list)
     denied_paths: list[str] = Field(default_factory=list)
     validation: list[ValidationCommand] = Field(default_factory=list)
     export: ExportConfig | None = None
@@ -157,15 +169,38 @@ class RepositoryConfig(_Strict):
             raise ValueError(f"invalid branch name {v!r}")
         return v
 
+    @field_validator("additional_working_branches")
+    @classmethod
+    def _check_additional_branches(cls, v: list[str]) -> list[str]:
+        for name in v:
+            if not is_safe_branch_name(name) or not ADDITIONAL_BRANCH_RE.match(name):
+                raise ValueError(f"invalid additional working branch name {name!r}")
+        return v
+
     @model_validator(mode="after")
     def _distinct_roles(self) -> "RepositoryConfig":
-        if self.integration_branch == self.working_branch:
-            raise ValueError("integration_branch and working_branch must differ")
+        names = [self.integration_branch, self.working_branch, *self.additional_working_branches]
+        if len(names) != len(set(names)):
+            raise ValueError("integration_branch, working_branch and additional_working_branches must all differ")
         return self
 
     @property
     def branches(self) -> tuple[str, str]:
+        """The required pair fetched together by fetch_heads(): both must
+        exist on the remote. Never widen this to include additional working
+        branches, which may legitimately not exist yet."""
         return (self.integration_branch, self.working_branch)
+
+    @property
+    def all_working_branches(self) -> tuple[str, ...]:
+        return (self.working_branch, *self.additional_working_branches)
+
+    @property
+    def known_branches(self) -> tuple[str, ...]:
+        """Every branch role this repository ever touches. Used only to
+        allowlist an individual fetch()/push target, never to fetch them all
+        at once (see ``branches``)."""
+        return (self.integration_branch, *self.all_working_branches)
 
     @property
     def effective_remote_url(self) -> str:

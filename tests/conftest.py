@@ -134,25 +134,27 @@ class GitEnv:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(content.encode() if isinstance(content, str) else content)
 
-    def make_patch(self, edits: dict[str, bytes | str | None], *, binary: bool = False) -> tuple[str, bytes]:
-        """Return (base_sha, patch) for edits against the current remote head."""
-        self._reset_seed()
+    def make_patch(
+        self, edits: dict[str, bytes | str | None], *, binary: bool = False, branch: str = BRANCH
+    ) -> tuple[str, bytes]:
+        """Return (base_sha, patch) for edits against ``branch``'s current remote head."""
+        self._reset_seed(branch)
         base = git(self.seed, "rev-parse", "HEAD")
         self._write(edits)
         git(self.seed, "add", "-A")
         args = ["diff", "--cached", "--no-color"] + (["--binary"] if binary else [])
         env = {**os.environ, **_TEST_GIT_ENV}
         patch = subprocess.run(["git", *args], cwd=self.seed, capture_output=True, env=env, check=True).stdout
-        self._reset_seed()
+        self._reset_seed(branch)
         return base, patch
 
-    def advance_remote(self, path: str = "concurrent.md", content: str = "someone else\n") -> str:
-        self._reset_seed()
+    def advance_remote(self, path: str = "concurrent.md", content: str = "someone else\n", branch: str = BRANCH) -> str:
+        self._reset_seed(branch)
         self._write({path: content})
         git(self.seed, "add", "-A")
         git(self.seed, "commit", "--quiet", "-m", "Concurrent change")
-        git(self.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{BRANCH}")
-        return self.head()
+        git(self.seed, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
+        return self.head(branch)
 
     def artifact(self, patch: bytes, base: str, **overrides) -> PushArtifact:
         overrides.setdefault("repository", self.github_repo)

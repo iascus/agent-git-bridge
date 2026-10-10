@@ -34,6 +34,20 @@ def test_stored_compression_is_accepted():
     assert parse_artifact(data, LIMITS).patch == PATCH
 
 
+def test_null_branch_parses():
+    """Repository policy resolves None to the default working branch; the
+    parser itself only validates shape."""
+    art = parse_artifact(make_zip(_members(request_for(PATCH, BASE, branch=None))), LIMITS)
+    assert art.request.branch is None
+
+
+def test_omitted_branch_parses():
+    req = request_for(PATCH, BASE)
+    del req["branch"]
+    art = parse_artifact(make_zip(_members(req)), LIMITS)
+    assert art.request.branch is None
+
+
 @pytest.mark.parametrize("data", [b"", b"not a zip at all", b"PK\x03\x04garbage"])
 def test_malformed_zip_rejected(data):
     with pytest.raises(ArtifactError):

@@ -38,7 +38,7 @@ def env(gitenv: GitEnv) -> GitEnv:
     gitenv.set_branch(BRANCH, base)
     gitenv.with_repo_config(export=EXPORT)
     gitenv.export_root = gitenv.tmp / "export"
-    gitenv.store_factory = lambda repo: LocalDirectorySnapshotStore(gitenv.export_root)
+    gitenv.store_factory = lambda repo, branch=None: LocalDirectorySnapshotStore(gitenv.export_root, branch=branch)
     return gitenv
 
 
@@ -76,7 +76,7 @@ def test_refresh_exports_both_artifacts_from_one_resolved_pair(env: GitEnv, tmp_
 
 def test_overlay_is_written_before_snapshot(env: GitEnv):
     recording = RecordingStore(LocalDirectorySnapshotStore(env.export_root))
-    env.store_factory = lambda repo: recording
+    env.store_factory = lambda repo, branch=None: recording
     assert env.repo.refresh().ok
     assert [role for role, _ in recording.ops] == ["working_diff", "snapshot"]
 
@@ -84,13 +84,13 @@ def test_overlay_is_written_before_snapshot(env: GitEnv):
 def test_interrupted_refresh_is_detectable_and_retry_repairs(env: GitEnv, tmp_path):
     assert env.repo.refresh().ok
     env.commit_to(BRANCH, {"AGENTS.md": "newer\n"})
-    env.store_factory = lambda repo: RecordingStore(LocalDirectorySnapshotStore(env.export_root), fail_on="snapshot")
+    env.store_factory = lambda repo, branch=None: RecordingStore(LocalDirectorySnapshotStore(env.export_root), fail_on="snapshot")
     out = env.repo.refresh()
     assert not out.ok and "Drive unavailable" in out.error.message
     # New overlay, old snapshot: the pinned sha256 no longer matches -> reader refuses.
     manifest, _, diff = artifacts(env)
     assert manifest["working_diff"]["sha256"] != hashlib.sha256(diff).hexdigest()
-    env.store_factory = lambda repo: LocalDirectorySnapshotStore(env.export_root)
+    env.store_factory = lambda repo, branch=None: LocalDirectorySnapshotStore(env.export_root)
     assert env.repo.status().snapshot.consistent is False
     assert env.repo.refresh().ok
     assert assert_coherent(env, tmp_path)["working_commit"] == env.head(BRANCH)
@@ -224,7 +224,7 @@ def test_status_reports_both_heads_and_snapshot(env: GitEnv):
 
 
 def test_refresh_without_export_config(gitenv: GitEnv, tmp_path):
-    gitenv.store_factory = lambda repo: LocalDirectorySnapshotStore(tmp_path / "x")
+    gitenv.store_factory = lambda repo, branch=None: LocalDirectorySnapshotStore(tmp_path / "x")
     assert gitenv.repo.refresh().error.code == "snapshot_not_configured"
 
 
@@ -236,7 +236,7 @@ def test_push_without_snapshot_transport_reports_not_configured(env: GitEnv):
 
 
 def test_snapshot_failure_after_push_keeps_git_success(env: GitEnv):
-    env.store_factory = lambda repo: RecordingStore(LocalDirectorySnapshotStore(env.export_root), fail_on="working_diff")
+    env.store_factory = lambda repo, branch=None: RecordingStore(LocalDirectorySnapshotStore(env.export_root), fail_on="working_diff")
     base, patch = env.make_patch({"a.md": "a\n"})
     out = env.repo.push_and_refresh(env.artifact(patch, base))
     assert out.ok and out.git_push == "success" and out.new_sha == env.head()
@@ -303,7 +303,7 @@ class FakeDriveApi:
 def drive_env(env: GitEnv) -> GitEnv:
     fake = FakeDriveApi()
     env.fake = fake
-    env.store_factory = lambda repo: GoogleDriveSnapshotStore(fake, repo_key=repo.key, drive_root="ChatGPT/rot3k")
+    env.store_factory = lambda repo, branch=None: GoogleDriveSnapshotStore(fake, repo_key=repo.key, drive_root="ChatGPT/rot3k", branch=branch)
     return env
 
 
