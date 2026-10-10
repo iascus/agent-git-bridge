@@ -5,8 +5,10 @@ Two data formats cross the trust boundary:
 - **Pull**: per project, a refresh *generation* the bridge writes to Google
   Drive: the integration-branch snapshot and the integration → working
   overlay (format version 2, or 3 if the project declares [project artifact
-  roots](#project-artifact-roots)).
-- **Push**: the ZIP ChatGPT produces to advance the working branch.
+  roots](#project-artifact-roots)). A repository with [additional working
+  branches](#additional-working-branches) gets one such pair per branch.
+- **Push**: the ZIP ChatGPT produces to advance a working branch (the
+  default one, or an explicitly named additional one).
 
 Terminology: **Push** advances the working branch. **Integration** is the
 working branch's changes entering the integration branch through a pull
@@ -186,6 +188,58 @@ pair, writes the overlay first and the snapshot last. The snapshot pins the
 overlay's SHA-256, so a half-finished or failed refresh is always detectable.
 An unchanged (M, D, selection) is not re-uploaded.
 
+### Additional working branches
+
+`repositories.<key>.additional_working_branches` names other branches a push
+may target, each independently exported as its own pair in the **same**
+`drive_root` folder:
+
+```text
+My Drive/ChatGPT/cyberpunk-tactics/
+├── cyberpunk-tactics-snapshot.zip               default pair (design-docs)
+├── cyberpunk-tactics-working.diff
+├── cyberpunk-tactics-gfx-assets-snapshot.zip     gfx-assets' own pair
+└── cyberpunk-tactics-gfx-assets-working.diff
+```
+
+Naming: `<key>-<branch>-snapshot.zip` / `<key>-<branch>-working.diff`
+(fixed, not configurable, unlike the default pair's `export.snapshot_name` /
+`working_diff_name`). Each pair's `snapshot.json` is a complete, independent
+generation — its own `generation_id`, fingerprint, Drive/local artifact
+identity and overlay SHA-256 link — built from the **same** integration
+branch head as the default pair's, so M's identity agrees across every pair
+produced by one refresh, but reconstructing or verifying one pair never
+requires the other. `snapshot.json.additional_working_branches` (when the
+list is non-empty) advertises the full configured list, so a reader of any
+one pair can discover the others' expected file names.
+
+A branch is never created automatically. A refresh (`POST .../refresh`) or
+`GET .../status` that finds a configured additional branch missing on the
+remote reports it as `skipped_missing` for that branch — the default pair
+still exports normally, and this is not an error. A transport or Git failure
+while handling an *existing* additional branch is reported as `failed` for
+that branch only (with its own `error`), distinctly from `skipped_missing`,
+and never affects the default pair or any other additional branch:
+
+```json
+"additional_branches": {
+  "gfx-assets": {
+    "branch": "gfx-assets", "state": "ok", "working_commit": "…",
+    "generation_id": "…", "uploaded": true,
+    "snapshot_name": "cyberpunk-tactics-gfx-assets-snapshot.zip",
+    "working_diff": {"filename": "cyberpunk-tactics-gfx-assets-working.diff", "…": "…"},
+    "rebase": {"state": "not_needed"}, "error": null
+  }
+}
+```
+
+(`GET .../status`'s per-branch entries are narrower: `branch`, `state`,
+`commit`, `generation_id`, `snapshot_name`, `working_diff_name`, `error`.)
+
+Existing Shortcuts and readers that only look at the top-level, default-pair
+fields are unaffected: `additional_branches` is purely additive on both
+`refresh` and `status`.
+
 ## Push: the push artifact
 
 ```text
@@ -215,11 +269,14 @@ encrypted.
 | Field | Rules |
 |---|---|
 | `repository` | `owner/name`; the endpoint's repository (or a declared former name). |
-| `branch` | Must be the configured **working branch**. Pushes to the integration branch are refused. |
-| `expected_base_sha` | Full hex commit ID; must equal the working branch head (`working_commit`), not `integration_commit`. |
+| `branch` | Optional; `null` or omitted selects the default working branch. Otherwise must be the default working branch or one of `additional_working_branches` — any other value (including the integration branch) is refused. Whichever branch is selected determines the push target, PR head and rebase-after-squash-merge check; it never affects `repository` or `expected_base_sha`'s own rules. |
+| `expected_base_sha` | Full hex commit ID; must equal the **selected** branch's real current head (its own pair's `working_commit`), never `integration_commit` and never another branch's `working_commit`. |
 | `patch_sha256` | SHA-256 of `changes.patch`; detects corruption only. |
 | `commit_message` | Non-blank, no NUL, ≤ 16 KiB. |
 | `created_at`, `generator` | Optional, informational. |
+
+A client that only ever uses the default branch needs no change at all:
+omitting `branch`, or sending it explicitly as before, both work.
 
 Unknown fields and duplicate keys are rejected. `changes.patch` is a `git
 diff` from D (paths `a/…`, `b/…`), produced with `--binary` so it may contain
@@ -265,11 +322,16 @@ Push response:
 }
 ```
 
-After a successful push the bridge (optionally) opens a PR working →
-integration if none is open, then refreshes from the heads as they are now
-(the new working head and the current integration head). Failures in either
-step are reported (`pull_request.state: "failed"`, `snapshot_refresh:
-"failed"`) and never turn `git_push: "success"` into a failure.
+The response's `branch` is always the **resolved** branch name (never
+`null`), whether the request named it explicitly or omitted it. After a
+successful push the bridge (optionally) opens a PR from that branch into the
+integration branch if none is open, then refreshes **every** configured
+pair — the pushed-to branch's and every other one — from the heads as they
+are now. Failures in either step are reported (`pull_request.state:
+"failed"`, `snapshot_refresh: "failed"`) and never turn `git_push: "success"`
+into a failure; a refresh failure specific to a *different* branch's pair
+than the one just pushed to shows up under that branch's own entry in the
+refresh response, never as this push's own failure.
 
 A push **never rebases**. If the working branch still contains a PR that
 was squash-merged into the integration branch, the push response carries
@@ -279,8 +341,15 @@ Refresh Git Snapshot to rebase it.`
 
 ### Rebase after a squash merge (Refresh)
 
-With `rebase_after_squash_merge: true`, a refresh first checks the latest
-**merged** PR working → integration (GitHub API). If its head commit P is
+With `rebase_after_squash_merge: true`, this applies independently to the
+default working branch and to every configured additional branch: each
+checks the latest merged PR **from its own branch** → integration, and a
+rebase only ever rewrites that one branch. Rebasing the default branch after
+its PR was squash-merged never touches an additional branch's branch or
+pair, and vice versa.
+
+A refresh first checks the latest **merged** PR working → integration
+(GitHub API). If its head commit P is
 still in the working branch's history, is *not* in the integration branch's
 history (i.e. it was squash-merged), and its squash commit is in the
 integration branch, the refresh:
@@ -343,7 +412,7 @@ Refresh response (abridged):
 | 200 | — | Success |
 | 400 | `invalid_artifact`, `patch_checksum_mismatch` | Archive or `request.json` invalid |
 | 401 | `unauthorized` | Missing or wrong bearer token |
-| 403 | `not_allowed` | Wrong repository, or branch is not the working branch |
+| 403 | `not_allowed` | Wrong repository, or branch is not an allowed working branch |
 | 404 | `unknown_repository` | No such project key |
 | 409 | `remote_changed` | Working head ≠ `expected_base_sha`; refresh and regenerate |
 | 409 | `push_race` | Working branch moved between check and push |
@@ -379,6 +448,19 @@ Paste into the ChatGPT project instructions (adjust names):
 > `patch_sha256` (SHA-256 hex of the exact `changes.patch` bytes),
 > `commit_message`. Build it with Python's `zipfile` and give me the file. I
 > push it from the share sheet.
+
+If the project configures `additional_working_branches`, add a paragraph
+naming each one and when to use it instead of the default, e.g. for a
+project with `design-docs` (default) and `gfx-assets`:
+
+> **Choosing a branch.** Default to `design-docs`. If the task clearly
+> creates or revises GFX artwork/assets under `assets/gfx/`, use `gfx-assets`
+> instead: download **its own** pair (`<key>-gfx-assets-snapshot.zip` +
+> `<key>-gfx-assets-working.diff`) and set `request.json`'s `branch` to
+> `"gfx-assets"` and `expected_base_sha` to **that pair's**
+> `working_commit` — never mix a base SHA from one branch's pair with the
+> other branch's `request.json`. If `gfx-assets` does not exist yet, say so;
+> do not fall back to `design-docs` silently or claim it exists.
 
 Example generator:
 
@@ -433,3 +515,27 @@ hunks (plain `git apply`, no new flag).
 `Refresh Git Snapshot`) already forward the ZIP body unmodified and never
 inspect `changes.patch` or `working.diff` content; a push containing binary
 files is indistinguishable, at the Shortcut layer, from one that does not.
+
+## Migrating to additional working branches
+
+Nothing to do for a repository that never configures
+`additional_working_branches`: `request.json.branch` was always required
+before and still works exactly as sent; `refresh`/`status` responses are
+unchanged (an empty `additional_branches: {}`).
+
+To opt in, add `additional_working_branches` to the repository's bridge
+configuration (not the manifest — this is a server-side policy about which
+branches a push may target, unlike [project artifact
+roots](#project-artifact-roots), which a repository opts into through its
+own manifest). No branch is created by this: the next refresh or status call
+simply reports it `skipped_missing` until it exists on GitHub.
+
+**iOS Shortcut: no change required for the default branch.** `Push Git
+Patch` already forwards `request.json` unmodified, so a ChatGPT-produced
+push naming an additional branch works through the existing Shortcut
+unchanged. A deployment that wants a human-friendly "which branch?" picker
+in the Shortcut itself (rather than leaving the choice to the ChatGPT
+project instructions) can add a **Choose from Menu** step setting a `Branch`
+text variable folded into the generated `request.json` before upload — this
+is optional UI sugar, not a protocol requirement, and is independent of
+ChatGPT's own branch choice described above.

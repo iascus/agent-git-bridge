@@ -48,7 +48,8 @@ repositories:
     github_repo: iascus/cyberpunk-tactics
     local_path: C:/Users/YOU/AppData/Local/agent-git-bridge/repos/cyberpunk-tactics.git
     integration_branch: main
-    working_branch: design-docs
+    working_branch: design-docs       # default push target
+    additional_working_branches: [gfx-assets]   # its own pair, its own PR; never auto-created
     denied_paths: [.github/**]
     export:
       drive_root: ChatGPT/cyberpunk-tactics

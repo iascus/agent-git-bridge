@@ -9,16 +9,25 @@ It is not a Git host, a CI system, or a general remote-execution service.
 
 ## Branch roles and source states
 
-Each project has two configured branches:
+Each project has an integration branch and at least one working branch:
 
 | Role | Example (Rot3K) | The bridge… |
 |---|---|---|
 | **integration branch** | `main` | reads it; exports it as the complete source snapshot; never writes to it |
 | **working branch** | `design-docs` | exports it as a tree overlay on the integration snapshot; **Push** advances it |
+| **additional working branch** (optional) | `gfx-assets` | same as a working branch, with its own pair, its own PR, exported only when it exists on the remote |
+
+A repository may configure `additional_working_branches`: other branches a
+push may target (`request.json.branch`, selecting among them), each
+exported as its own, fully independent snapshot + overlay pair. The default
+working branch stays the target when `branch` is omitted or `null`, so a
+repository with no additional branches configured is byte-for-byte
+unaffected by this. See [Additional working
+branches](docs/PROTOCOL.md#additional-working-branches).
 
 Implementation branches (e.g. `poc1`) are outside the bridge's model; they and
-the working branch integrate into the integration branch through pull requests
-that the user merges.
+the working branch(es) integrate into the integration branch through pull
+requests that the user merges.
 
 ChatGPT therefore holds three trees:
 
@@ -195,10 +204,17 @@ by a fingerprint and not re-uploaded.
 - Scope `drive.file`: the bridge only sees files and folders it created.
 - `export.drive_root` (e.g. `ChatGPT/rot3k`) holds exactly two files,
   `<key>-snapshot.zip` and `<key>-working.diff`, each updated in place (stable
-  Drive file ID and name).
+  Drive file ID and name) — plus, for each configured additional working
+  branch, two more: `<key>-<branch>-snapshot.zip` and
+  `<key>-<branch>-working.diff`, in the **same** folder.
 - Private `appProperties` record the project key, artifact role and generation
   metadata; the Drive state is self-describing and a fresh process needs no
-  local index.
+  local index. An additional branch's pair uses its own `gb_kind` value
+  (`"<kind>@<branch>"`, e.g. `"archive@gfx-assets"`) so its files can never
+  be found by, or collide with, the default pair's query — the default
+  pair's own `gb_kind` values (`"archive"`, `"working_diff"`) are completely
+  unchanged, so its existing Drive file IDs survive this feature's
+  introduction untouched.
 
 ## Rebase after a squash merge
 
@@ -232,13 +248,13 @@ push (any time)     ─►  commit + normal push ─► plain refresh (+ warning
 
 | Module | Responsibility |
 |---|---|
-| `git_bridge.config` | Strict YAML configuration: repositories, branch roles, validation commands, export, limits. |
+| `git_bridge.config` | Strict YAML configuration: repositories, branch roles (including `additional_working_branches`), validation commands, export, limits. |
 | `git_bridge.gitcmd` | The only place that executes Git: fixed argv, no shell, isolated from user/system config, timeouts, credentials via environment for network operations only. |
-| `git_bridge.artifact` | Parse and validate the push ZIP in memory (limits, exact member names, checksum, strict `request.json`). |
-| `git_bridge.repository` | Per-repository clone, fetch, status, isolated worktrees, validate/push pipeline, refresh, push-then-refresh, PRs. `Bridge` is the registry. |
-| `git_bridge.snapshot` | Manifest-based selection (source files + artifact roots), synthetic trees, binary-capable overlay, `snapshot.json` (format 2, or 3 with artifact roots), deterministic ZIP, ordered export. |
+| `git_bridge.artifact` | Parse and validate the push ZIP in memory (limits, exact member names, checksum, strict `request.json`; `branch` is optional). |
+| `git_bridge.repository` | Per-repository clone, fetch, status, isolated worktrees, validate/push pipeline, refresh (default pair plus every additional working branch), push-then-refresh, PRs. `Bridge` is the registry. |
+| `git_bridge.snapshot` | Manifest-based selection (source files + artifact roots), synthetic trees, binary-capable overlay, `snapshot.json` (format 2, or 3 with artifact roots), deterministic ZIP, ordered export. Branch-agnostic: called once per pair. |
 | `git_bridge.manifest` | Parse the `PROJECT_SOURCE_FILES` and `PROJECT_ARTIFACT_ROOTS` blocks. |
-| `git_bridge.store` / `drive` | `SnapshotStore` (two artifacts per project): local directory and Google Drive; OAuth. |
+| `git_bridge.store` / `drive` | `SnapshotStore` (two artifacts per pair — default or one additional branch — distinguished by an optional `branch` scope): local directory and Google Drive; OAuth. |
 | `git_bridge.github` | Find/open pull requests (never merge). |
 | `git_bridge.api` | FastAPI: health, status, refresh, validate-patch, push. |
 | `git_bridge.auth` | `Authenticator` seam; bearer token. |
@@ -251,8 +267,8 @@ push (any time)     ─►  commit + normal push ─► plain refresh (+ warning
 | Method | Path | Auth | Purpose |
 |---|---|---|---|
 | GET | `/health` | none | `{"status":"ok"}`; nothing else |
-| GET | `/repos/{repo}/status` | bearer | Both branch heads, merge base, ahead/behind, current generation |
-| POST | `/repos/{repo}/refresh` | bearer | Export a new generation (snapshot + overlay) |
+| GET | `/repos/{repo}/status` | bearer | Both default-pair branch heads, merge base, ahead/behind, current generation, plus a per-branch map for any configured additional working branches |
+| POST | `/repos/{repo}/refresh` | bearer | Export a new generation for the default pair and every configured additional working branch that exists on the remote |
 | POST | `/repos/{repo}/validate-patch` | bearer | All push checks, no commit |
 | POST | `/repos/{repo}/push` | bearer | Guarded commit + push to the working branch, PR, refresh |
 | POST | `/repos/{repo}/publish` | bearer | Deprecated alias of `/push` (kept for existing Shortcuts) |
@@ -279,6 +295,15 @@ same repository they are serialised. Configuration rejects shared GitHub names,
 overlapping clones or Drive roots, and a clone inside `work_dir`. Branch names
 are per repository; nothing is hard-coded.
 
+Within one repository, additional working branches deliberately share the
+clone, the lock and the Drive folder with the default pair (not isolated the
+way repositories are from each other): the git-level work for the default
+pair and every additional branch happens under the same `self.lock` in one
+`refresh()` call, serialised like any other git operation on that
+repository, while each pair's own export (Drive/local upload) is isolated
+from the others by its own try/except, so one branch's export failure can
+never corrupt or block another's.
+
 **Renames.** `github_repo` can change without changing the key;
 `former_github_repos` keeps accepting push artifacts naming the old repository
 and re-points a clone whose remote is exactly the old GitHub URL.
@@ -299,9 +324,10 @@ and re-points a clone whose remote is exactly the old GitHub URL.
 
 ```text
 parse <key>-push.zip ──► 400/413 invalid archive, checksum mismatch
-repository + branch  ──► 403 unless repository matches and branch == working branch
+repository + branch  ──► 403 unless repository matches and branch resolves to an allowed working branch
+                          (branch omitted/null -> the default working branch)
 [per-repo lock]
-fetch working branch
+fetch the resolved branch
 head == expected_base_sha ? ──► 409 remote_changed
 git worktree add --detach <tmp> <expected_base_sha>
 git apply --check --index   ──► 422 patch_does_not_apply   (binary hunks included, no extra flag)
@@ -314,11 +340,12 @@ git commit-tree (tree captured before validation)
 git push <remote> <sha>:refs/heads/<working>   (no '+', no --force)
                             ──► 409 push_race / 502 push_rejected
 [finally] remove worktree
-then: PR (optional), refresh — failures there never fail the push
+then: PR (optional, from the resolved branch), refresh of every configured
+      pair (default and additional) — failures there never fail the push
 ```
 
-Concurrency is checked against the **working** head, never the integration
-head.
+Concurrency is checked against the **resolved branch's** head, never the
+integration head and never another working branch's head.
 
 ### Validation commands
 
@@ -359,6 +386,12 @@ prefer validators that only inspect files. See `SECURITY.md`.
     no bridge code change. Git's own binary-patch format (`--binary`,
     `git apply`) carries both text and binary changes through the same
     overlay and push patch; no second parallel push format was added.
+11. **Additional working branches reuse the single-branch pipeline per
+    branch**, not a parallel implementation: `build_generation`/
+    `export_generation` are unchanged; only the branch name, artifact names
+    and (for Drive) the `gb_kind` value vary per call. A branch that does not
+    exist on the remote is reported as skipped, never an error, and is never
+    created by the bridge.
 
 ## Known limitations
 

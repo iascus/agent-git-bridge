@@ -51,7 +51,11 @@ configuration, and the patch is applied only in an isolated worktree.
 
 - Only repositories and branches listed in configuration can be fetched,
   validated, committed or exported. The URL key and the repository named in
-  `request.json` must agree.
+  `request.json` must agree. `request.json.branch` may name the default
+  working branch, be omitted/`null` (same effect), or name one of
+  `additional_working_branches`; any other value — including the
+  integration branch or an arbitrary string — is refused before any Git
+  operation, exactly like the single-branch case.
 - No endpoint accepts Git arguments, shell commands, file paths, URLs or
   remote names. Git runs via fixed argument lists (`shell=False`) with values
   that are either server configuration or validated full-length hex SHAs.
@@ -61,12 +65,15 @@ configuration, and the patch is applied only in an isolated worktree.
   *Pull requests* permission would technically allow merging through the API;
   the bridge contains no code path that does so.
 - **One exception to "no force push"**: with `rebase_after_squash_merge`,
-  Refresh may rewrite the **working branch** after its PR was squash-merged,
-  using `--force-with-lease=<branch>:<exact old head>` (a compare-and-swap:
-  anything pushed meanwhile is never overwritten), only after the rebased
-  tree was verified equal to `git merge-tree` of the two heads. The
-  integration branch can never be rewritten (enforced in code), and a push
-  never triggers it.
+  Refresh may rewrite **a working branch** (the default one, or an
+  additional one, independently of each other) after its own PR was
+  squash-merged, using `--force-with-lease=<branch>:<exact old head>` (a
+  compare-and-swap: anything pushed meanwhile is never overwritten), only
+  after the rebased tree was verified equal to `git merge-tree` of the two
+  heads. The integration branch can never be rewritten (enforced in code —
+  the lease guard checks membership in the full set of configured working
+  branches, never a single hard-coded name), and a push never triggers it.
+  Rebasing one working branch never touches another's ref, pair or PR.
 - Pushes use a plain refspec (`<sha>:refs/heads/<branch>`): no `+`, no
   `--force`, no `--force-with-lease`, no deletions, no tags, no ref rewriting.
 - Optimistic concurrency: the branch head must equal `expected_base_sha`
@@ -111,10 +118,18 @@ configuration, and the patch is applied only in an isolated worktree.
 - Each refresh builds the integration snapshot and the working overlay from
   one resolved pair of commits; the snapshot pins the overlay's SHA-256, so a
   reader can never accept artifacts from different generations.
-- Only the integration and working branches are ever fetched; pushes can
-  only target the working branch, never the integration branch.
+- Only the integration branch and the configured working branch(es) are
+  ever fetched; pushes can only target a working branch, never the
+  integration branch. An additional working branch is fetched with its own,
+  single-refspec fetch, so a repository's refresh never fails outright just
+  because one additional branch does not exist yet — a required branch
+  (integration, or the default working branch) missing is still a hard
+  failure, as before.
 - Drive scope `drive.file`: the bridge cannot read or change any file it did
-  not create. Removed files go to the Drive trash (recoverable).
+  not create. Removed files go to the Drive trash (recoverable). An
+  additional working branch's pair uses its own Drive property value
+  (`gb_kind: "<kind>@<branch>"`), so it can never be found by, or
+  overwritten through, the default pair's own lookup query, and vice versa.
 - Only text files listed in `PROJECT_SOURCE_FILES` are exported that way;
   binaries, symlinks and oversized files are listed but not uploaded.
 - A repository may opt a directory into binary export via its own manifest's

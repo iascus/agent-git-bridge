@@ -3,7 +3,9 @@
 A small, security-conscious bridge between an AI conversation and Git.
 
 Each project has an **integration branch** (e.g. `main`) and a **working
-branch** (e.g. `design-docs`):
+branch** (e.g. `design-docs`) — and, optionally, other **additional working
+branches** (e.g. `gfx-assets` for binary asset batches), each with its own
+independent Drive pair and PR, never created automatically:
 
 - **Pull.** On every refresh the bridge writes two files with stable names to
   Google Drive, built from one resolved pair of branch heads:
@@ -73,8 +75,8 @@ tailscale serve --bg --https=10000 http://127.0.0.1:8000
 |---|---|
 | `git-bridge serve` | Run the HTTP service (loopback only, one worker; stops earlier instances) |
 | `git-bridge check` | Diagnose configuration and credentials |
-| `git-bridge status <repo>` | Both branch heads, merge base, ahead/behind, current generation |
-| `git-bridge refresh <repo>` | Export snapshot + working overlay |
+| `git-bridge status <repo>` | Default branch heads, merge base, ahead/behind, current generation, plus any additional working branches |
+| `git-bridge refresh <repo>` | Export snapshot + working overlay for the default pair and every additional working branch that exists |
 | `git-bridge validate <repo> <zip>` | Run all push checks locally |
 | `git-bridge push <repo> <zip>` | Push a ZIP from the host |
 | `git-bridge init-token [--force]` | Create or rotate the bearer token |
@@ -94,12 +96,13 @@ tailscale serve --bg --https=10000 http://127.0.0.1:8000
 
 Start from [config/example.yaml](config/example.yaml) (Linux) or
 [config/example.windows.yaml](config/example.windows.yaml). Per repository:
-`github_repo`, `integration_branch`, `working_branch`, `export.manifest`,
-`export.drive_root`, optional `pull_request`. Several repositories can be
-configured side by side under stable project keys (e.g. `rot3k`,
-`cyberpunk-tactics`), each with its own clone, lock and Drive folder; GitHub
-renames are handled with `former_github_repos`. Secrets live in files outside
-the repository, referenced by path.
+`github_repo`, `integration_branch`, `working_branch`, optional
+`additional_working_branches`, `export.manifest`, `export.drive_root`,
+optional `pull_request`. Several repositories can be configured side by side
+under stable project keys (e.g. `rot3k`, `cyberpunk-tactics`), each with its
+own clone, lock and Drive folder; GitHub renames are handled with
+`former_github_repos`. Secrets live in files outside the repository,
+referenced by path.
 
 ## License
 

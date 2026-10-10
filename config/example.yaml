@@ -46,9 +46,16 @@ repositories:
 
     # Integration branch: read only; exported as the complete snapshot.
     integration_branch: main
-    # Working branch: the only branch a push may advance; exported as the
-    # integration -> working tree overlay.
+    # Working branch: the default push target (when request.json omits
+    # "branch"); exported as the integration -> working tree overlay.
     working_branch: design-docs
+    # Other allowlisted push targets, each exported as its own snapshot +
+    # overlay pair (e.g. <key>-<branch>-snapshot.zip) alongside the default
+    # one. Never created automatically; a refresh/status call that finds one
+    # missing on the remote reports it as skipped, not an error. See
+    # docs/PROTOCOL.md#additional-working-branches. Example (commented out):
+    # additional_working_branches:
+    #   - gfx-assets
 
     # Staged paths matching these globs are rejected.
     denied_paths:
@@ -86,6 +93,11 @@ repositories:
     local_path: /var/lib/git-bridge/repos/cyberpunk-tactics
     integration_branch: main
     working_branch: design-docs
+    # GFX asset batches are pushed to their own branch, with their own
+    # snapshot + overlay pair and their own PR into main; design-docs is
+    # unaffected either way. Never created automatically.
+    additional_working_branches:
+      - gfx-assets
     denied_paths:
       - .github/**
     export:

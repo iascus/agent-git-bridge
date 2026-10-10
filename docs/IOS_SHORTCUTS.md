@@ -54,6 +54,16 @@ That is the whole Shortcut. It must **not** unzip, parse, re-compress,
 base64-encode or otherwise touch the file, and it contains no GitHub or Google
 credentials.
 
+**Additional working branches** (`additional_working_branches`, e.g. a
+`gfx-assets` branch for binary asset batches) need no Shortcut change: since
+the Shortcut never inspects `request.json`, a push naming a different branch
+goes through exactly the same way. The *choice* of branch is made by
+whatever generates `request.json` (ChatGPT's own project instructions), not
+by this Shortcut. A deployment that wants the person to pick the branch by
+hand can insert a **Choose from Menu** step before uploading and splice its
+result into the uploaded ZIP's `request.json.branch`, but that is optional
+UI sugar on top of an unchanged protocol, not a requirement.
+
 The response `message` already reads e.g.:
 
 - `Pushed 0a1b2c3d4e5f to iascus/rt3k@design-docs: 2 file(s), +10 -3. Opened PR #12 into main: https://github.com/iascus/rt3k/pull/12 Drive snapshot updated.`
@@ -82,9 +92,11 @@ Duplicate the Shortcut as **Validate Git Patch** with URL
 ## Refresh Git Snapshot
 
 Re-exports both source states to Google Drive: the integration-branch
-snapshot and the integration → working overlay. Use it after anything changed
-the branches outside the bridge (a PR merged into `main`, a push or rebase
-from VS Code), or after a push reported `snapshot_refresh: failed`.
+snapshot and the integration → working overlay — plus, for each configured
+additional working branch that exists on GitHub, its own pair. Use it after
+anything changed the branches outside the bridge (a PR merged into `main`, a
+push or rebase from VS Code), or after a push reported `snapshot_refresh:
+failed`.
 
 1. New Shortcut → **Refresh Git Snapshot**. It does not need the Share Sheet.
 2. **Text**: the bearer token.
