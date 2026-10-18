@@ -108,3 +108,13 @@ class SnapshotError(BridgeError):
 class SnapshotNotConfigured(BridgeError):
     code = "snapshot_not_configured"
     http_status = 409
+
+
+class RebaseFailed(BridgeError):
+    """rebase_onto_integration conflicted or otherwise failed. Unlike
+    rebase_after_squash_merge (reported per-branch in RebaseInfo, never
+    aborting a refresh), this aborts the whole refresh: nothing is exported
+    for any branch until it's resolved."""
+
+    code = "rebase_failed"
+    http_status = 409

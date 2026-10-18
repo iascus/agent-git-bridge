@@ -144,6 +144,16 @@ class RepositoryConfig(_Strict):
     # the commits made after the merge) and updates it with a lease-guarded
     # force push. Needs the "Pull requests: Read" token permission.
     rebase_after_squash_merge: bool = False
+    # On every refresh (never a push), unconditionally rebase the working
+    # branch and every additional working branch onto the integration
+    # branch's current head whenever it is ahead -- no GitHub API needed.
+    # Already-merged history (squash, rebase, or any other merge strategy)
+    # is still detected correctly, by tree equality rather than a PR
+    # lookup; see docs/PROTOCOL.md. Independent of (and typically an
+    # alternative to) rebase_after_squash_merge. Unlike that setting, a
+    # conflict or any other failure here aborts the whole refresh instead of
+    # being reported per-branch: nothing is exported until it's resolved.
+    rebase_onto_integration: bool = False
 
     @field_validator("github_repo")
     @classmethod

@@ -43,6 +43,9 @@ repositories:
       draft: false
     # Refresh rebases the working branch after its PR was squash-merged.
     rebase_after_squash_merge: true
+    # Alternative: unconditionally rebase onto main whenever it's ahead (no
+    # squash-merge detection), but a conflict aborts the whole refresh. Pick one.
+    # rebase_onto_integration: true
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics

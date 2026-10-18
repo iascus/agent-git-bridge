@@ -87,6 +87,10 @@ repositories:
     # merge) and updates it with a lease-guarded force push. A push never
     # rebases; it warns while a rebase is pending.
     rebase_after_squash_merge: true
+    # Alternative to the above: unconditionally rebase onto the integration
+    # branch whenever it's ahead, no squash-merge detection needed -- but a
+    # conflict aborts the whole refresh instead of just warning. Pick one.
+    # rebase_onto_integration: true
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
