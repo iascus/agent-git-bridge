@@ -46,6 +46,32 @@ def test_repositories_must_not_share_local_path():
         Settings.model_validate({"work_dir": "/w", "repositories": {"a": repo, "b": repo}})
 
 
+def _base_settings(**overrides):
+    repo = {"github_repo": "a/b", "local_path": "/srv/x", "integration_branch": "main", "working_branch": "dev"}
+    return {"work_dir": "/w", "repositories": {"a": repo}, **overrides}
+
+
+def test_viewer_storage_dir_must_not_overlap_work_dir():
+    with pytest.raises(ValueError):
+        Settings.model_validate(
+            _base_settings(viewer={"storage_dir": "/w", "base_url": "https://example.test"})
+        )
+
+
+def test_viewer_storage_dir_must_not_overlap_a_repository_local_path():
+    with pytest.raises(ValueError):
+        Settings.model_validate(
+            _base_settings(viewer={"storage_dir": "/srv/x", "base_url": "https://example.test"})
+        )
+
+
+def test_viewer_is_optional_and_independent_when_configured():
+    settings = Settings.model_validate(
+        _base_settings(viewer={"storage_dir": "/srv/viewer", "base_url": "https://example.test"})
+    )
+    assert settings.viewer.storage_dir == Path("/srv/viewer")
+
+
 @pytest.mark.parametrize(
     "path,pattern,expected",
     [

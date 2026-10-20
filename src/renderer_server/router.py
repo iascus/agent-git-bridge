@@ -4,19 +4,18 @@ import json
 import re
 import struct
 import zlib
-from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Callable, Mapping
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.datastructures import UploadFile
 
-from .auth import require_import_token
-from .config import Settings
-from .storage import (
-    ContentNotFound,
-    FileStorage,
-)
+from .storage import ContentNotFound, FileStorage
+
+if False:  # pragma: no cover - type-checking only, avoids a hard git_bridge import
+    from git_bridge.auth import Principal
+    from git_bridge.config import ViewerConfig
 
 
 TEMPLATE_PATH = Path(__file__).parent / "templates" / "render.html"
@@ -28,25 +27,31 @@ MARKDOWN_MATH_RE = re.compile(r"\\\(|\\\[|\$\$")
 ICON_PNG = None
 
 
-def create_app(settings: Settings) -> FastAPI:
-    storage = FileStorage(settings.storage_dir)
+def create_viewer_router(
+    viewer: "ViewerConfig", authenticate: Callable[[Mapping[str, str]], "Principal"]
+) -> tuple[APIRouter, FileStorage]:
+    """Router for /viewer/*, mounted onto git_bridge's own app (see
+    git_bridge.api.create_app). ``authenticate`` is git_bridge's existing
+    BearerTokenAuthenticator.authenticate -- one shared token for the whole
+    server, not a separate one for this feature. Only POST /import is
+    gated by it; every GET route stays open (the Tailscale network boundary
+    is the only protection), because /render is meant to be opened as a
+    plain link, which cannot carry an Authorization header. The caller is
+    responsible for calling the returned FileStorage's ensure_root() during
+    startup."""
+    storage = FileStorage(viewer.storage_dir)
+    router = APIRouter()
 
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        storage.ensure_root()
-        yield
+    def require_import_auth(request: Request) -> "Principal":
+        return authenticate(request.headers)
 
-    app = FastAPI(title="Private Renderer Import Server", lifespan=lifespan)
-    app.state.settings = settings
-    app.state.storage = storage
-
-    @app.get("/health")
+    @router.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/favicon.ico", include_in_schema=False)
-    @app.get("/apple-touch-icon.png", include_in_schema=False)
-    @app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
+    @router.get("/favicon.ico", include_in_schema=False)
+    @router.get("/apple-touch-icon.png", include_in_schema=False)
+    @router.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
     def icon() -> Response:
         return Response(
             content=_icon_png(),
@@ -54,7 +59,7 @@ def create_app(settings: Settings) -> FastAPI:
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
-    @app.get("/static/jsdiff.min.js", include_in_schema=False)
+    @router.get("/static/jsdiff.min.js", include_in_schema=False)
     def jsdiff() -> FileResponse:
         return FileResponse(
             STATIC_PATH / "jsdiff.min.js",
@@ -62,7 +67,7 @@ def create_app(settings: Settings) -> FastAPI:
             headers={"Cache-Control": "public, max-age=31536000, immutable"},
         )
 
-    @app.get("/static/mathjax.min.js", include_in_schema=False)
+    @router.get("/static/mathjax.min.js", include_in_schema=False)
     def mathjax() -> FileResponse:
         return FileResponse(
             STATIC_PATH / "mathjax.min.js",
@@ -70,15 +75,15 @@ def create_app(settings: Settings) -> FastAPI:
             headers={"Cache-Control": "public, max-age=31536000, immutable"},
         )
 
-    @app.get("/")
+    @router.get("/")
     def root() -> dict[str, str]:
         return {
             "status": "ok",
-            "health": "/health",
-            "import": "/import",
+            "health": "/viewer/health",
+            "import": "/viewer/import",
         }
 
-    @app.get("/api/content", response_class=PlainTextResponse)
+    @router.get("/api/content", response_class=PlainTextResponse)
     def api_content() -> PlainTextResponse:
         try:
             return PlainTextResponse(
@@ -88,14 +93,14 @@ def create_app(settings: Settings) -> FastAPI:
         except ContentNotFound:
             raise HTTPException(status_code=404, detail="Content not found") from None
 
-    @app.get("/api/meta")
+    @router.get("/api/meta")
     def api_meta() -> dict[str, object]:
         try:
             return storage.get_metadata()
         except ContentNotFound:
             raise HTTPException(status_code=404, detail="Content not found") from None
 
-    @app.post("/import", dependencies=[Depends(require_import_token(settings.effective_import_token))])
+    @router.post("/import", dependencies=[Depends(require_import_auth)])
     async def import_content(request: Request) -> JSONResponse:
         content_type = request.headers.get("content-type", "")
         filename: str | None = None
@@ -106,12 +111,12 @@ def create_app(settings: Settings) -> FastAPI:
             file = form.get("file")
             if not isinstance(file, UploadFile):
                 raise HTTPException(status_code=400, detail="Multipart body must include file field 'file'")
-            payload = await file.read(settings.max_upload_bytes + 1)
+            payload = await file.read(viewer.max_upload_bytes + 1)
             filename = file.filename
             media_type = file.content_type
         elif content_type.lower().startswith("application/json"):
             payload = await request.body()
-            _reject_oversized(payload, settings.max_upload_bytes)
+            _reject_oversized(payload, viewer.max_upload_bytes)
             try:
                 data = json.loads(payload.decode("utf-8"))
             except UnicodeDecodeError as exc:
@@ -124,25 +129,25 @@ def create_app(settings: Settings) -> FastAPI:
             if filename_value is not None and not isinstance(filename_value, str):
                 raise HTTPException(status_code=400, detail="JSON field 'filename' must be a string")
             text = data["content"]
-            _reject_oversized(text.encode("utf-8"), settings.max_upload_bytes)
+            _reject_oversized(text.encode("utf-8"), viewer.max_upload_bytes)
             filename = filename_value
             media_type = "application/json"
             storage.save(text, filename=filename, content_type="text/plain")
-            return JSONResponse(_import_response(settings))
+            return JSONResponse(_import_response(viewer))
         else:
             payload = await request.body()
             media_type = content_type.split(";", 1)[0] or "text/plain"
 
-        _reject_oversized(payload, settings.max_upload_bytes)
+        _reject_oversized(payload, viewer.max_upload_bytes)
         try:
             text = payload.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise HTTPException(status_code=400, detail="Imported content must be valid UTF-8 text") from exc
 
         storage.save(text, filename=filename, content_type=media_type or "text/plain")
-        return JSONResponse(_import_response(settings))
+        return JSONResponse(_import_response(viewer))
 
-    @app.get("/render")
+    @router.get("/render")
     def render() -> HTMLResponse:
         try:
             content = storage.get_content()
@@ -153,7 +158,7 @@ def create_app(settings: Settings) -> FastAPI:
         rendered = rendered.replace("__IMPORTED_KIND_JSON__", json.dumps(detect_content_kind(content)))
         return HTMLResponse(rendered)
 
-    return app
+    return router, storage
 
 
 def _reject_oversized(payload: bytes, max_upload_bytes: int) -> None:
@@ -164,10 +169,10 @@ def _reject_oversized(payload: bytes, max_upload_bytes: int) -> None:
         )
 
 
-def _import_response(settings: Settings) -> dict[str, str]:
-    base_url = settings.base_url.rstrip("/")
+def _import_response(viewer: "ViewerConfig") -> dict[str, str]:
+    base_url = viewer.base_url.rstrip("/")
     return {
-        "url": f"{base_url}/render",
+        "url": f"{base_url}/viewer/render",
     }
 
 
@@ -176,7 +181,7 @@ def _script_json(value: str) -> str:
 
 
 def detect_content_kind(text: str) -> str:
-    text = text.lstrip("\ufeff")
+    text = text.lstrip("﻿")
     first_content_line = next(
         (line for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()),
         "",

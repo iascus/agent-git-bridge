@@ -7,17 +7,21 @@ Endpoints:
   POST /repos/{repo}/validate-patch     body: <key>-push.zip (raw or multipart)
   POST /repos/{repo}/push               body: <key>-push.zip (raw or multipart)
   POST /repos/{repo}/publish            deprecated alias of /push
+  /viewer/*                             optional, see docs/VIEWER.md
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from email import policy
 from email.parser import BytesParser
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
+
+from renderer_server.router import create_viewer_router
 
 from .artifact import parse_artifact
 from .auth import Authenticator, BearerTokenAuthenticator, Principal
@@ -80,9 +84,21 @@ def create_app(
     auth = authenticator or BearerTokenAuthenticator.from_file(settings.server.bearer_token_file)
     limits = settings.limits
 
+    viewer_router = viewer_storage = None
+    if settings.viewer is not None:
+        viewer_router, viewer_storage = create_viewer_router(settings.viewer, auth.authenticate)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        if viewer_storage is not None:
+            viewer_storage.ensure_root()
+        yield
+
     # No interactive docs or schema: nothing to browse for anyone on the tailnet.
-    app = FastAPI(title="agent-git-bridge", docs_url=None, redoc_url=None, openapi_url=None)
+    app = FastAPI(title="agent-git-bridge", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.bridge = bridge
+    if viewer_router is not None:
+        app.include_router(viewer_router, prefix="/viewer")
 
     @app.exception_handler(BridgeError)
     async def _bridge_error(request: Request, exc: BridgeError) -> JSONResponse:

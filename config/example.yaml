@@ -19,6 +19,14 @@ google:
   client_secrets_file: /etc/git-bridge/google-client.json
   token_file: /var/lib/git-bridge/google-token.json
 
+# Optional: /viewer/* routes, an iOS-Shortcut-friendly text/Markdown/diff
+# import-and-render page. Omit this whole section to run without it. See
+# docs/VIEWER.md.
+viewer:
+  storage_dir: /var/lib/git-bridge/viewer
+  base_url: https://cave.tail364856.ts.net:10000   # how this server is actually reached
+  max_upload_bytes: 10485760
+
 git_identity:                    # author and committer of every bridge commit
   name: iascus
   email: 127579634+iascus@users.noreply.github.com
