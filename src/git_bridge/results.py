@@ -43,7 +43,13 @@ class PullRequestInfo(BaseModel):
 
 
 class RebaseInfo(BaseModel):
-    """Working branch vs. the latest squash-merged PR into the integration branch.
+    """Working branch vs. the integration branch: either GitHub-PR-driven
+    squash-merge detection (rebase_after_squash_merge) or the unconditional
+    rebase (rebase_onto_integration, which also detects already-merged
+    history, but by tree equality rather than a PR lookup -- ``merged_head``
+    may be set there too, ``pull_request`` is always None for this mode;
+    its "conflict"/"failed" states are raised as RebaseFailed instead of
+    returned, so a reader only ever sees "not_needed" or "rebased" here).
 
     state:
       not_needed  no squash-merged PR is still contained in the working branch
@@ -65,6 +71,8 @@ class RebaseInfo(BaseModel):
     def warning(self, working: str, integration: str, *, on_push: bool = False) -> str:
         pr = f"PR #{self.pull_request}" if self.pull_request else "a merged PR"
         if self.state == "rebased":
+            if self.pull_request is None:  # rebase_onto_integration: unconditional, no PR involved
+                return f"Rebased {working} onto {integration} ({self.replayed_commits} commit(s) replayed)."
             return f"Rebased {working} onto {integration} after {pr} ({self.replayed_commits} commit(s) replayed)."
         if self.state == "needed":
             action = "run Refresh Git Snapshot to rebase it" if on_push else "rebasing is disabled for this repository"

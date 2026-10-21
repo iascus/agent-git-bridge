@@ -26,6 +26,7 @@ from .errors import (
     PatchPolicyViolation,
     PushRace,
     PushRejected,
+    RebaseFailed,
     RemoteChanged,
     SnapshotError,
     SnapshotNotConfigured,
@@ -316,10 +317,17 @@ class Repository:
         as skipped, never an error; one that fails some other way is
         reported as failed, which must never be confused with "skipped").
 
-        With ``rebase_after_squash_merge`` and ``allow_rebase``, a working
-        branch that still contains a squash-merged PR is first rebased onto
-        the integration branch. A push refreshes with ``allow_rebase=False``:
-        it only reports whether a rebase is needed."""
+        With ``rebase_onto_integration`` and ``allow_rebase``, a working
+        branch is first unconditionally rebased onto the integration
+        branch's current head when it is ahead; a conflict or any other
+        failure raises RebaseFailed, aborting the whole refresh (no
+        snapshot exported for any branch) rather than being reported
+        per-branch. Otherwise, with ``rebase_after_squash_merge`` and
+        ``allow_rebase``, a working branch that still contains a
+        squash-merged PR is first rebased onto the integration branch
+        (reported per-branch, never aborting). A push refreshes with
+        ``allow_rebase=False``: it only reports whether a rebase is
+        needed."""
         cfg = self.config
         outcome = RefreshOutcome(
             repository=cfg.github_repo,
@@ -333,17 +341,23 @@ class Repository:
             with self.lock:
                 self.ensure_clone()
                 integration, working = self.fetch_heads()
-                outcome.rebase = self._rebase_check(integration, working, cfg.working_branch)
-                if (
-                    allow_rebase
-                    and cfg.rebase_after_squash_merge
-                    and outcome.rebase is not None
-                    and outcome.rebase.state == "needed"
-                ):
+                if allow_rebase and cfg.rebase_onto_integration:
                     self._remove_stale_worktrees()
-                    outcome.rebase = self._rebase_after_merge(integration, working, outcome.rebase, cfg.working_branch)
+                    outcome.rebase = self._rebase_onto_integration(integration, working, cfg.working_branch)
                     if outcome.rebase.state == "rebased":
                         working = outcome.rebase.new_commit
+                else:
+                    outcome.rebase = self._rebase_check(integration, working, cfg.working_branch)
+                    if (
+                        allow_rebase
+                        and cfg.rebase_after_squash_merge
+                        and outcome.rebase is not None
+                        and outcome.rebase.state == "needed"
+                    ):
+                        self._remove_stale_worktrees()
+                        outcome.rebase = self._rebase_after_merge(integration, working, outcome.rebase, cfg.working_branch)
+                        if outcome.rebase.state == "rebased":
+                            working = outcome.rebase.new_commit
                 gen = build_generation(
                     self.git,
                     integration_commit=integration,
@@ -416,23 +430,31 @@ class Repository:
         """Fetch, rebase-check (and rebase if due) and build one additional
         branch's generation. Caller holds self.lock. Any failure is caught
         here, never raised: one branch's trouble can never affect the
-        default pair or another additional branch."""
+        default pair or another additional branch. The one exception is
+        RebaseFailed (rebase_onto_integration): that one is deliberately
+        re-raised, aborting the whole refresh rather than just this branch."""
         try:
             store = self._store(branch)
             branch_head = self.fetch_optional(branch)
             if branch_head is None:
                 return _PreparedBranch(branch=branch, store=store, skipped=True)
-            rebase_info = self._rebase_check(integration, branch_head, branch)
-            if (
-                allow_rebase
-                and self.config.rebase_after_squash_merge
-                and rebase_info is not None
-                and rebase_info.state == "needed"
-            ):
+            if allow_rebase and self.config.rebase_onto_integration:
                 self._remove_stale_worktrees()
-                rebase_info = self._rebase_after_merge(integration, branch_head, rebase_info, branch)
+                rebase_info = self._rebase_onto_integration(integration, branch_head, branch)
                 if rebase_info.state == "rebased":
                     branch_head = rebase_info.new_commit
+            else:
+                rebase_info = self._rebase_check(integration, branch_head, branch)
+                if (
+                    allow_rebase
+                    and self.config.rebase_after_squash_merge
+                    and rebase_info is not None
+                    and rebase_info.state == "needed"
+                ):
+                    self._remove_stale_worktrees()
+                    rebase_info = self._rebase_after_merge(integration, branch_head, rebase_info, branch)
+                    if rebase_info.state == "rebased":
+                        branch_head = rebase_info.new_commit
             gen = build_generation(
                 self.git,
                 integration_commit=integration,
@@ -447,6 +469,8 @@ class Repository:
                 additional_working_branches=list(self.config.additional_working_branches),
             )
             return _PreparedBranch(branch=branch, store=store, generation=gen, rebase=rebase_info, working_commit=branch_head)
+        except RebaseFailed:
+            raise
         except BridgeError as exc:
             return _PreparedBranch(branch=branch, error=_error_info(exc))
 
@@ -678,8 +702,76 @@ class Repository:
         integration branch, verify, and update ``branch`` with a
         lease-guarded force push. Nothing changes unless every step succeeds.
         Caller holds self.lock."""
-        base = info.merged_head
-        result = info.model_copy()
+        return self._execute_rebase(integration, working, branch, base=info.merged_head, template=info)
+
+    def _find_squash_base(self, integration: str, working: str, merge_base: str) -> str | None:
+        """The most recent commit in ``working``'s own history (since
+        ``merge_base``) whose *tree* already exists among the integration
+        branch's commits unique since ``merge_base``. That tree equality is
+        exactly what a GitHub squash merge (or rebase merge, or any other
+        merge whose result matches ``working``'s state at some point)
+        produces -- detected purely from the repository's content, with no
+        GitHub API call and no assumption about which merge strategy was
+        used. None if no such point is found (nothing of this branch's
+        history has been incorporated into integration yet)."""
+        integration_trees = set(self.git.text(["log", f"{merge_base}..{integration}", "--format=%T"]).splitlines())
+        if not integration_trees:
+            return None
+        # Newest first: the first hit is the most recent (and so the only
+        # relevant) already-merged point in working's history.
+        for line in self.git.text(["log", f"{merge_base}..{working}", "--format=%H %T"]).splitlines():
+            commit, tree = line.split()
+            if tree in integration_trees:
+                return commit
+        return None
+
+    def _rebase_onto_integration(self, integration: str, working: str, branch: str) -> RebaseInfo:
+        """rebase_onto_integration: unconditionally rebase ``branch`` onto
+        the integration branch's current head when it is ahead -- no GitHub
+        lookup required, just "is the integration branch already contained
+        in the working branch". Caller holds self.lock.
+
+        If part of ``working``'s own history was already merged into
+        ``integration`` (by any means -- squash, rebase, or a content-equal
+        regular merge), _find_squash_base locates that point by tree
+        equality and only the commits made after it are replayed, exactly
+        like rebase_after_squash_merge's GitHub-driven rebase; otherwise the
+        whole branch is replayed from the merge-base, same as before. Either
+        way, _execute_rebase's merge-tree check still verifies the result,
+        so a wrong guess can never land a lossy or reverting rebase -- at
+        worst it surfaces as an (honest) conflict.
+
+        Unlike _rebase_after_merge, a conflict or any other failure raises
+        RebaseFailed rather than being returned in the RebaseInfo: the whole
+        refresh aborts instead of exporting a stale or partial snapshot."""
+        if self._is_ancestor(integration, working):
+            return RebaseInfo(state="not_needed", old_commit=working)
+        merge_base = self.git.text(["merge-base", integration, working])
+        squash_base = self._find_squash_base(integration, working, merge_base)
+        base = squash_base or merge_base
+        result = self._execute_rebase(
+            integration,
+            working,
+            branch,
+            base=base,
+            template=RebaseInfo(state="not_needed", old_commit=working, merged_head=squash_base),
+        )
+        if result.state in ("conflict", "failed"):
+            detail = result.error or ", ".join(result.conflicts[:5])
+            raise RebaseFailed(
+                f"rebase of {branch} onto {integration} {result.state}: {detail}",
+                branch=branch,
+                state=result.state,
+                conflicts=result.conflicts,
+            )
+        return result
+
+    def _execute_rebase(self, integration: str, working: str, branch: str, *, base: str, template: RebaseInfo) -> RebaseInfo:
+        """Replay the commits in ``working`` after ``base`` onto
+        ``integration``, verify the result, and update ``branch`` with a
+        lease-guarded force push. Nothing changes unless every step
+        succeeds. Caller holds self.lock."""
+        result = template.model_copy()
         # What a merge would produce: the rebased tree must be identical.
         merged = self.git.run(["merge-tree", "--write-tree", "--name-only", integration, working], check=False)
         if merged.returncode != 0:

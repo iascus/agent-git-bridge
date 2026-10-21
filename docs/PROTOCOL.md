@@ -390,6 +390,40 @@ reports it. The refresh response gains:
 After a rebase, local checkouts of the working branch (e.g. VS Code) must be
 updated with `git pull --rebase` or reset to `origin/<working branch>`.
 
+### Unconditional rebase onto the integration branch (Refresh)
+
+`rebase_onto_integration: true` is a stronger, more general alternative to
+`rebase_after_squash_merge`: on every refresh (never a push), each working
+branch — the default and every configured additional branch — is rebased
+onto the integration branch's current head whenever it is ahead. No GitHub
+lookup is required, but squash merges (and rebase merges, and any other
+merge strategy) are still detected correctly: before picking a replay
+point, the bridge looks for the most recent commit in the working branch's
+own history whose *tree* already appears among the integration branch's
+commits since their common ancestor. That tree equality is exactly what any
+of those merge strategies produces, regardless of which one was actually
+used or whether a GitHub PR was involved at all. If found, only the commits
+made after that point are replayed (`git rebase --onto <integration>
+<that commit>`) — `merged_head` is set to it, same field name as
+`rebase_after_squash_merge` uses for a PR's head, but `pull_request` stays
+`null` since no PR lookup happened. If nothing in the working branch's
+history has been incorporated into the integration branch yet, the whole
+branch is replayed from the plain merge-base instead, same as a bare `git
+rebase <integration>`. Either way the result is still verified against
+`git merge-tree` before anything is pushed (see above), so a wrong guess at
+the replay point can never land a lossy or reverting rebase — at worst it
+surfaces as an honest conflict instead of a silently wrong one.
+
+The one deliberate difference: a conflict or any other failure **aborts the
+whole refresh** — `error.code: "rebase_failed"`, HTTP 409, nothing exported
+for any branch — rather than being reported per-branch like
+`rebase_after_squash_merge`'s `conflict`/`failed` states. A rebase that
+already happened to another branch earlier in the same refresh (its force
+push already landed) is not rolled back; only the snapshot export for this
+call is skipped. The two settings are independent; enabling both on the
+same repository is accepted but redundant, since the unconditional check
+always fires first and makes the squash-merge-specific one a no-op.
+
 Refresh response (abridged):
 
 ```json
@@ -416,6 +450,7 @@ Refresh response (abridged):
 | 404 | `unknown_repository` | No such project key |
 | 409 | `remote_changed` | Working head ≠ `expected_base_sha`; refresh and regenerate |
 | 409 | `push_race` | Working branch moved between check and push |
+| 409 | `rebase_failed` | `rebase_onto_integration` conflicted or failed; nothing exported |
 | 413 | `artifact_too_large` | Size limit exceeded |
 | 422 | `patch_does_not_apply`, `patch_policy_violation`, `validation_failed` | Nothing committed |
 | 502 | `push_rejected`, `snapshot_failed` | Remote refused / Drive export failed |

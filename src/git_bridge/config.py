@@ -144,6 +144,16 @@ class RepositoryConfig(_Strict):
     # the commits made after the merge) and updates it with a lease-guarded
     # force push. Needs the "Pull requests: Read" token permission.
     rebase_after_squash_merge: bool = False
+    # On every refresh (never a push), unconditionally rebase the working
+    # branch and every additional working branch onto the integration
+    # branch's current head whenever it is ahead -- no GitHub API needed.
+    # Already-merged history (squash, rebase, or any other merge strategy)
+    # is still detected correctly, by tree equality rather than a PR
+    # lookup; see docs/PROTOCOL.md. Independent of (and typically an
+    # alternative to) rebase_after_squash_merge. Unlike that setting, a
+    # conflict or any other failure here aborts the whole refresh instead of
+    # being reported per-branch: nothing is exported until it's resolved.
+    rebase_onto_integration: bool = False
 
     @field_validator("github_repo")
     @classmethod
@@ -278,6 +288,19 @@ class GoogleConfig(_Strict):
     token_file: Path
 
 
+class ViewerConfig(_Strict):
+    """Optional /viewer/* routes: an iOS Shortcut POSTs text/Markdown/diff
+    content to /viewer/import (bearer-token gated, same server.bearer_token_file
+    as everything else); a browser opens /viewer/render to view it. See
+    docs/VIEWER.md. Omit this section entirely to run without it."""
+
+    storage_dir: Path
+    # Base URL used to build the render link returned by POST /import, e.g.
+    # the Tailscale Serve hostname this server is actually reached at.
+    base_url: str
+    max_upload_bytes: Annotated[int, Field(gt=0)] = 10 * 1024 * 1024
+
+
 # Extra Git settings an operator may set (e.g. http.sslBackend=schannel on
 # Windows). Anything that could run programs or change history is excluded.
 ALLOWED_EXTRA_GIT_CONFIG = frozenset({"http.sslbackend", "http.sslcainfo", "http.proxy", "http.version"})
@@ -293,6 +316,7 @@ class Settings(_Strict):
     server: ServerConfig = ServerConfig()
     snapshot: SnapshotConfig = SnapshotConfig()
     google: GoogleConfig | None = None
+    viewer: ViewerConfig | None = None
     audit_log: Path | None = None
     repositories: Annotated[dict[str, RepositoryConfig], Field(min_length=1)]
 
@@ -327,6 +351,10 @@ class Settings(_Strict):
         seen_names: dict[str, str] = {}
         paths: list[tuple[str, Path]] = []
         drive_roots: list[tuple[str, str]] = []
+        if self.viewer is not None:
+            paths.append(("viewer", self.viewer.storage_dir.resolve()))
+            if _overlaps(paths[-1][1], work_dir):
+                raise ValueError("viewer.storage_dir overlaps work_dir")
         for key, repo in self.repositories.items():
             for name in repo.accepted_github_repos:
                 other = seen_names.setdefault(name.casefold(), key)

@@ -27,6 +27,14 @@ google:
   client_secrets_file: C:/Users/YOU/.config/agent-git-bridge/google-client.json
   token_file: C:/Users/YOU/.config/agent-git-bridge/google-token.json
 
+# Optional: /viewer/* routes, an iOS-Shortcut-friendly text/Markdown/diff
+# import-and-render page. Omit this whole section to run without it. See
+# docs/VIEWER.md.
+viewer:
+  storage_dir: C:/Users/YOU/AppData/Local/agent-git-bridge/viewer
+  base_url: https://cave.tail364856.ts.net:10000   # how this server is actually reached
+  max_upload_bytes: 10485760
+
 repositories:
   rot3k:
     github_repo: iascus/rot3k
@@ -43,6 +51,9 @@ repositories:
       draft: false
     # Refresh rebases the working branch after its PR was squash-merged.
     rebase_after_squash_merge: true
+    # Alternative: unconditionally rebase onto main whenever it's ahead (no
+    # squash-merge detection), but a conflict aborts the whole refresh. Pick one.
+    # rebase_onto_integration: true
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics

@@ -19,6 +19,14 @@ google:
   client_secrets_file: /etc/git-bridge/google-client.json
   token_file: /var/lib/git-bridge/google-token.json
 
+# Optional: /viewer/* routes, an iOS-Shortcut-friendly text/Markdown/diff
+# import-and-render page. Omit this whole section to run without it. See
+# docs/VIEWER.md.
+viewer:
+  storage_dir: /var/lib/git-bridge/viewer
+  base_url: https://cave.tail364856.ts.net:10000   # how this server is actually reached
+  max_upload_bytes: 10485760
+
 git_identity:                    # author and committer of every bridge commit
   name: iascus
   email: 127579634+iascus@users.noreply.github.com
@@ -87,6 +95,10 @@ repositories:
     # merge) and updates it with a lease-guarded force push. A push never
     # rebases; it warns while a rebase is pending.
     rebase_after_squash_merge: true
+    # Alternative to the above: unconditionally rebase onto the integration
+    # branch whenever it's ahead, no squash-merge detection needed -- but a
+    # conflict aborts the whole refresh instead of just warning. Pick one.
+    # rebase_onto_integration: true
 
   cyberpunk-tactics:
     github_repo: iascus/cyberpunk-tactics
